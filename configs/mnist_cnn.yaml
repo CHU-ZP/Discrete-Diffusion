@@ -1,0 +1,37 @@
+seed: 0
+
+dataset:
+  name: mnist
+  num_classes: 32
+  shape: [28, 28]
+  conditional: true
+  num_labels: 10
+  root: data/mnist
+  download: true
+
+diffusion:
+  timesteps: 100
+  schedule: linear
+  beta_start: 0.005
+  beta_end: 0.18
+  transition: uniform
+
+model:
+  name: cnn2d
+  base_channels: 96
+  num_blocks: 8
+  dropout: 0.1
+
+train:
+  batch_size: 128
+  steps: 10000
+  lr: 0.0002
+  weight_decay: 0.01
+  log_every: 100
+  sample_every: 1000
+  num_workers: 2
+  device: auto
+
+output:
+  run_dir: runs/mnist_cnn
+  sample_dir: outputs/mnist_cnn

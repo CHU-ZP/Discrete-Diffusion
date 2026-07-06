@@ -1,0 +1,35 @@
+seed: 0
+
+dataset:
+  name: modelnet10_voxel
+  num_classes: 2
+  shape: [16, 16, 16]
+  conditional: true
+  num_labels: 10
+  cache_path: data/modelnet10_voxel_16.npz
+
+diffusion:
+  timesteps: 100
+  schedule: linear
+  beta_start: 0.005
+  beta_end: 0.15
+  transition: uniform
+
+model:
+  name: unet3d
+  base_channels: 32
+  dropout: 0.1
+
+train:
+  batch_size: 16
+  steps: 50000
+  lr: 0.0002
+  weight_decay: 0.01
+  log_every: 100
+  sample_every: 1000
+  num_workers: 2
+  device: auto
+
+output:
+  run_dir: runs/voxel_modelnet10
+  sample_dir: outputs/voxel_modelnet10
