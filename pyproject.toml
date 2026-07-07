@@ -10,6 +10,7 @@ dependencies = [
   "torch",
   "torchvision",
   "numpy",
+  "trimesh",
   "matplotlib",
   "pyyaml",
   "tqdm",
@@ -18,3 +19,9 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["ddiff*"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.1",
+]

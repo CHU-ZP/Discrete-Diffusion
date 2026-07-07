@@ -2,11 +2,13 @@ seed: 0
 
 dataset:
   name: modelnet10_voxel
+  # Voxel token classes: 0 = empty, 1 = occupied.
   num_classes: 2
-  shape: [16, 16, 16]
+  shape: [32, 32, 32]
   conditional: true
-  num_labels: 10
-  cache_path: data/modelnet10_voxel_16.npz
+  # ModelNet object classes: the 4 most frequent classes are selected by the preparation script.
+  num_labels: 4
+  cache_path: data/modelnet10_voxel_32_top4.npz
 
 diffusion:
   timesteps: 100
@@ -18,13 +20,19 @@ diffusion:
 model:
   name: unet3d
   base_channels: 32
+  channel_mults: [1, 2, 4]
+  num_res_blocks: 2
   dropout: 0.1
 
 train:
-  batch_size: 16
+  batch_size: 8
   steps: 50000
   lr: 0.0002
   weight_decay: 0.01
+  # Automatically up-weight rare voxel tokens. For binary occupancy this raises
+  # the occupied class loss relative to the dominant empty class.
+  token_loss_weights: auto
+  max_token_loss_weight: 8.0
   log_every: 100
   sample_every: 1000
   num_workers: 2

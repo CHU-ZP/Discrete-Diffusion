@@ -31,6 +31,8 @@ def build_model(cfg: dict[str, Any]):
         return UNet3D(
             **common,
             base_channels=int(model_cfg.get("base_channels", 32)),
+            channel_mults=tuple(int(mult) for mult in model_cfg.get("channel_mults", [1, 2, 4])),
+            num_res_blocks=int(model_cfg.get("num_res_blocks", 2)),
             dropout=float(model_cfg.get("dropout", 0.1)),
         )
 

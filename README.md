@@ -72,15 +72,58 @@ You can also use the helper scripts:
 ./scripts/sample_mnist_cnn.sh
 ```
 
-## Extending To ModelNet10 Voxels
+## Prepare ModelNet10 Voxels
 
-The future voxel path is configured in `configs/voxel_modelnet10.yaml`. It expects cached integer voxel tensors shaped `[B, 16, 16, 16]` with values in `{0, 1}` and optional class labels in `{0, ..., 9}`.
+The voxel path is configured in `configs/voxel_modelnet10.yaml`. The preparation script reads ModelNet10 `.off` meshes, selects the 4 most frequent object classes, normalizes each mesh into a shared cube, voxelizes it at `32x32x32`, flood-fills closed interiors when possible, and writes a cached `.npz`.
 
-The scaffold files are:
+```bash
+uv run python scripts/prepare_modelnet_voxels.py \
+  --input data/ModelNet10 \
+  --output data/modelnet10_voxel_32_top4.npz \
+  --resolution 32 \
+  --num-model-classes 4 \
+  --overwrite
+```
+
+The output cache contains:
 
 ```text
+train_x: uint8 [N, 32, 32, 32], values 0 empty / 1 occupied
+train_y: int64 [N], labels remapped to 0..3
+test_x:  uint8 [N, 32, 32, 32]
+test_y:  int64 [N]
+class_names: selected ModelNet class names in label order
+```
+
+In the voxel config, `dataset.num_classes: 2` means voxel token classes, while `dataset.num_labels: 4` means the selected object classes used for conditional generation.
+
+To inspect the generated voxel cache, open:
+
+```text
+notebooks/visualize_voxels.ipynb
+```
+
+The notebook prints cache metadata, label counts, occupancy statistics, 3D voxel renderings, orthogonal slices, and examples by class label.
+
+The voxel files are:
+
+```text
+scripts/prepare_modelnet_voxels.py
+configs/voxel_modelnet10.yaml
+notebooks/visualize_voxels.ipynb
 src/ddiff/data/modelnet_voxel.py
 src/ddiff/models/unet3d.py
 src/ddiff/visualization/voxels.py
-scripts/prepare_modelnet_voxels.py
 ```
+
+The `unet3d` backbone is a residual encoder-decoder 3D U-Net with downsampling, upsampling, bottleneck blocks, skip connections, and time/class conditioning in each residual block.
+
+Voxel training also enables token-level weighted cross entropy:
+
+```yaml
+train:
+  token_loss_weights: auto
+  max_token_loss_weight: 8.0
+```
+
+With `auto`, the training script counts voxel token frequencies in the train split and up-weights rare tokens. For binary occupancy this gives occupied voxels a larger loss weight than empty voxels, which helps counter the strong empty/occupied imbalance without changing the diffusion transition process.

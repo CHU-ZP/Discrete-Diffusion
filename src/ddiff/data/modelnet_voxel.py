@@ -8,11 +8,12 @@ from torch.utils.data import Dataset
 
 
 class ModelNetVoxelDataset(Dataset):
-    """Lightweight scaffold for future cached ModelNet10 voxel tensors.
+    """Cached ModelNet voxel tensors for categorical diffusion.
 
-    The expected cache is an ``.npz`` containing categorical voxel values:
-    either ``x`` and optional ``y`` arrays, or split-specific ``train_x`` /
-    ``test_x`` arrays with matching ``train_y`` / ``test_y`` labels.
+    The preferred cache is an ``.npz`` with split-specific ``train_x`` /
+    ``test_x`` uint8 occupancy arrays and matching ``train_y`` / ``test_y``
+    labels. The voxel values are categorical tokens, usually ``0`` for empty
+    and ``1`` for occupied.
     """
 
     def __init__(self, cache_path: str | Path, split: str = "train") -> None:
@@ -20,8 +21,8 @@ class ModelNetVoxelDataset(Dataset):
         if not self.cache_path.exists():
             raise FileNotFoundError(
                 f"Voxel cache not found at {self.cache_path}. "
-                "Run scripts/prepare_modelnet_voxels.py after adding a voxelization "
-                "pipeline, or point dataset.cache_path at an existing .npz cache."
+                "Run scripts/prepare_modelnet_voxels.py or point "
+                "dataset.cache_path at an existing .npz cache."
             )
 
         data = np.load(self.cache_path, allow_pickle=False)

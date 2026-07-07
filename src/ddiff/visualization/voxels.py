@@ -6,7 +6,12 @@ import matplotlib.pyplot as plt
 import torch
 
 
-def save_voxel_grid(x: torch.Tensor, path: str | Path, max_items: int = 4) -> None:
+def save_voxel_grid(
+    x: torch.Tensor,
+    path: str | Path,
+    max_items: int = 4,
+    labels: torch.Tensor | None = None,
+) -> None:
     """Save a small occupancy visualization for binary voxel samples."""
 
     path = Path(path)
@@ -15,12 +20,16 @@ def save_voxel_grid(x: torch.Tensor, path: str | Path, max_items: int = 4) -> No
     x = x.detach().cpu()
     if x.ndim == 3:
         x = x.unsqueeze(0)
+    if labels is not None:
+        labels = labels.detach().cpu().reshape(-1)
     count = min(max_items, x.shape[0])
 
     fig = plt.figure(figsize=(count * 2.5, 2.5))
     for idx in range(count):
         ax = fig.add_subplot(1, count, idx + 1, projection="3d")
         ax.voxels(x[idx].bool().numpy(), facecolors="#3b82f6", edgecolor="k", linewidth=0.1)
+        if labels is not None and idx < labels.shape[0]:
+            ax.set_title(f"y={int(labels[idx].item())}", fontsize=8)
         ax.set_axis_off()
     fig.tight_layout()
     fig.savefig(path, dpi=160)

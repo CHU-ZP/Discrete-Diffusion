@@ -66,7 +66,7 @@ def main() -> None:
         )
         save_reverse_chain(chain, sample_dir / "reverse_chain.png", value_range=value_range)
     elif cfg["dataset"]["name"] == "modelnet10_voxel":
-        save_voxel_grid(samples.cpu(), sample_dir / "generated_voxels.png")
+        save_voxel_grid(samples.cpu(), sample_dir / "generated_voxels.png", labels=labels)
 
     print(f"Saved samples to {Path(sample_dir).resolve()}.")
 

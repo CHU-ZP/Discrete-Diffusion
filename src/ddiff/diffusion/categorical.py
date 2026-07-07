@@ -108,6 +108,7 @@ class CategoricalDiffusion:
         model: torch.nn.Module,
         x0: torch.Tensor,
         y: torch.Tensor | None = None,
+        class_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch = x0.shape[0]
         t = torch.randint(
@@ -119,7 +120,7 @@ class CategoricalDiffusion:
         )
         x_t = self.q_sample(x0, t)
         logits = model(x_t, t, y)
-        return F.cross_entropy(logits, x0)
+        return F.cross_entropy(logits, x0, weight=class_weights)
 
     @torch.no_grad()
     def sample(
