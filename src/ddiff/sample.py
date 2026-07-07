@@ -26,6 +26,12 @@ def main() -> None:
             "Use 'all' or omit it to cycle through all labels."
         ),
     )
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale. Defaults to sampling.guidance_scale or 1.0.",
+    )
     parser.add_argument("--device", default=None, help="Optional device override.")
     args = parser.parse_args()
     if args.num_samples <= 0:
@@ -46,6 +52,7 @@ def main() -> None:
 
     spatial_shape = tuple(cfg["dataset"]["shape"])
     labels = _build_conditioning_labels(cfg, args.num_samples, args.labels, device)
+    guidance_scale = _resolve_guidance_scale(cfg, args.guidance_scale)
     samples, chain = diffusion.sample(
         model,
         spatial_shape,
@@ -53,6 +60,7 @@ def main() -> None:
         batch_size=args.num_samples,
         return_chain=True,
         device=device,
+        guidance_scale=guidance_scale,
     )
 
     if cfg["dataset"]["name"] == "mnist":
@@ -110,6 +118,12 @@ def _parse_labels_arg(labels_arg: str | None, num_labels: int) -> list[int]:
         if label < 0 or label >= num_labels:
             raise ValueError(f"Label {label} is outside the valid range [0, {num_labels - 1}].")
     return labels
+
+
+def _resolve_guidance_scale(cfg: dict, guidance_scale: float | None) -> float:
+    if guidance_scale is not None:
+        return float(guidance_scale)
+    return float(cfg.get("sampling", {}).get("guidance_scale", 1.0))
 
 
 if __name__ == "__main__":

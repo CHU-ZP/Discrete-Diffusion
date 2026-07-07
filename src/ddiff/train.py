@@ -69,6 +69,9 @@ def train(cfg: dict[str, Any]) -> None:
     sample_every = int(cfg["train"].get("sample_every", 500))
     conditional = bool(cfg["dataset"].get("conditional", False))
     spatial_shape = tuple(cfg["dataset"]["shape"])
+    class_dropout_prob = float(cfg["train"].get("class_dropout_prob", 0.0))
+    if conditional and class_dropout_prob > 0.0:
+        print(f"Using classifier-free class dropout: {class_dropout_prob:.3f}")
 
     progress = tqdm(range(1, total_steps + 1), desc="train", dynamic_ncols=True)
     last_loss = None
@@ -76,9 +79,10 @@ def train(cfg: dict[str, Any]) -> None:
         batch = next(batches)
         x0 = batch["x"].to(device=device, dtype=torch.long)
         y = batch["y"].to(device=device, dtype=torch.long) if conditional and batch["y"] is not None else None
+        y_for_loss = _drop_conditioning_labels(y, class_dropout_prob)
 
         optimizer.zero_grad(set_to_none=True)
-        loss = diffusion.training_loss(model, x0, y, class_weights=token_loss_weights)
+        loss = diffusion.training_loss(model, x0, y_for_loss, class_weights=token_loss_weights)
         loss.backward()
         optimizer.step()
 
@@ -168,6 +172,7 @@ def _save_samples(
             batch_size=64,
             return_chain=True,
             device=device,
+            guidance_scale=_guidance_scale(cfg),
         )
         value_range = _sample_value_range(cfg)
         save_image_grid(samples.cpu(), sample_dir / "generated_samples.png", nrow=8, labels=labels, value_range=value_range)
@@ -180,8 +185,16 @@ def _save_samples(
         )
         save_reverse_chain(chain, sample_dir / "reverse_chain.png", value_range=value_range)
     elif name == "modelnet10_voxel":
-        labels = _balanced_conditioning_labels(cfg, batch_size=4, device=device)
-        samples = diffusion.sample(model, spatial_shape, y=labels, batch_size=4, device=device)
+        batch_size = int(cfg["train"].get("sample_batch_size", 4))
+        labels = _balanced_conditioning_labels(cfg, batch_size=batch_size, device=device)
+        samples = diffusion.sample(
+            model,
+            spatial_shape,
+            y=labels,
+            batch_size=batch_size,
+            device=device,
+            guidance_scale=_guidance_scale(cfg),
+        )
         save_voxel_grid(
             samples.cpu(),
             sample_dir / f"generated_voxels_step_{step:06d}.png",
@@ -194,6 +207,23 @@ def _example_labels(examples: list[dict[str, torch.Tensor | None]]) -> torch.Ten
     if any(label is None for label in labels):
         return None
     return torch.stack([label for label in labels if label is not None]).long()
+
+
+def _drop_conditioning_labels(
+    y: torch.Tensor | None,
+    class_dropout_prob: float,
+) -> torch.Tensor | None:
+    if y is None or class_dropout_prob <= 0.0:
+        return y
+    if class_dropout_prob >= 1.0:
+        return torch.full_like(y, -1)
+
+    drop = torch.rand(y.shape, device=y.device) < class_dropout_prob
+    if not torch.any(drop):
+        return y
+    dropped = y.clone()
+    dropped[drop] = -1
+    return dropped
 
 
 def _build_token_loss_weights(
@@ -265,6 +295,10 @@ def _is_image_dataset(cfg: dict[str, Any]) -> bool:
 
 def _sample_value_range(cfg: dict[str, Any]) -> tuple[int, int]:
     return 0, int(cfg["dataset"]["num_classes"]) - 1
+
+
+def _guidance_scale(cfg: dict[str, Any]) -> float:
+    return float(cfg.get("sampling", {}).get("guidance_scale", 1.0))
 
 
 if __name__ == "__main__":

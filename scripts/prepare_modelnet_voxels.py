@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,8 +30,8 @@ def main() -> None:
         )
     )
     parser.add_argument("--input", default="data/ModelNet10", help="Root directory of extracted ModelNet10.")
-    parser.add_argument("--output", default="data/modelnet10_voxel_32_top4.npz", help="Output .npz cache path.")
-    parser.add_argument("--resolution", type=int, default=32, help="Voxel grid resolution.")
+    parser.add_argument("--output", default="data/modelnet10_voxel_64_top4.npz", help="Output .npz cache path.")
+    parser.add_argument("--resolution", type=int, default=64, help="Voxel grid resolution.")
     parser.add_argument(
         "--num-model-classes",
         type=int,
@@ -60,6 +62,12 @@ def main() -> None:
         help="Optional cap per split and class, useful for quick smoke tests.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Parallel worker processes for mesh voxelization.",
+    )
+    parser.add_argument(
         "--skip-errors",
         action="store_true",
         help="Skip meshes that fail loading or voxelization instead of aborting.",
@@ -82,6 +90,8 @@ def main() -> None:
         raise ValueError("--padding-voxels must be non-negative.")
     if args.surface_dilation < 0:
         raise ValueError("--surface-dilation must be non-negative.")
+    if args.workers <= 0:
+        raise ValueError("--workers must be positive.")
     if output_path.exists() and not args.overwrite:
         raise FileExistsError(f"{output_path} already exists; pass --overwrite to replace it.")
 
@@ -102,6 +112,7 @@ def main() -> None:
         fill_interior=not args.surface_only,
         surface_dilation=args.surface_dilation,
         skip_errors=args.skip_errors,
+        workers=args.workers,
     )
     test_x, test_y, test_paths = build_split(
         selected,
@@ -112,6 +123,7 @@ def main() -> None:
         fill_interior=not args.surface_only,
         surface_dilation=args.surface_dilation,
         skip_errors=args.skip_errors,
+        workers=args.workers,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,43 +210,82 @@ def build_split(
     fill_interior: bool,
     surface_dilation: int,
     skip_errors: bool,
+    workers: int,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    xs: list[np.ndarray] = []
-    ys: list[int] = []
-    paths: list[str] = []
-    total = sum(len(getattr(cls, f"{split}_files")) for cls in selected)
-    progress = tqdm(total=total, desc=f"voxelize {split}", dynamic_ncols=True)
+    results: list[tuple[int, np.ndarray, int, str]] = []
+    tasks: list[tuple[int, str, int, str, int, float, bool, int]] = []
 
     for cls in selected:
         files: list[Path] = getattr(cls, f"{split}_files")
         for path in files:
-            try:
-                voxels = voxelize_off(
-                    path,
-                    resolution=resolution,
-                    padding_voxels=padding_voxels,
-                    fill_interior=fill_interior,
-                    surface_dilation=surface_dilation,
+            tasks.append(
+                (
+                    len(tasks),
+                    str(path),
+                    cls.label,
+                    str(path.relative_to(input_root)),
+                    resolution,
+                    padding_voxels,
+                    fill_interior,
+                    surface_dilation,
                 )
+            )
+
+    progress = tqdm(total=len(tasks), desc=f"voxelize {split}", dynamic_ncols=True)
+
+    if workers == 1:
+        for task in tasks:
+            try:
+                index, voxels, label, rel_path = voxelize_task(task)
             except Exception as exc:
                 if not skip_errors:
-                    raise RuntimeError(f"Failed to voxelize {path}") from exc
-                print(f"Skipping {path}: {type(exc).__name__}: {exc}")
+                    raise RuntimeError(f"Failed to voxelize {task[1]}") from exc
+                print(f"Skipping {task[1]}: {type(exc).__name__}: {exc}")
                 progress.update(1)
                 continue
-
-            xs.append(voxels)
-            ys.append(cls.label)
-            paths.append(str(path.relative_to(input_root)))
+            results.append((index, voxels, label, rel_path))
             progress.update(1)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(voxelize_task, task): task for task in tasks}
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    index, voxels, label, rel_path = future.result()
+                except Exception as exc:
+                    if not skip_errors:
+                        raise RuntimeError(f"Failed to voxelize {task[1]}") from exc
+                    print(f"Skipping {task[1]}: {type(exc).__name__}: {exc}")
+                    progress.update(1)
+                    continue
+                results.append((index, voxels, label, rel_path))
+                progress.update(1)
 
     progress.close()
-    if not xs:
+    if not results:
         empty_x = np.zeros((0, resolution, resolution, resolution), dtype=np.uint8)
         empty_y = np.zeros((0,), dtype=np.int64)
         return empty_x, empty_y, []
 
+    results.sort(key=lambda item: item[0])
+    xs = [voxels for _, voxels, _, _ in results]
+    ys = [label for _, _, label, _ in results]
+    paths = [rel_path for _, _, _, rel_path in results]
     return np.stack(xs, axis=0).astype(np.uint8), np.asarray(ys, dtype=np.int64), paths
+
+
+def voxelize_task(
+    task: tuple[int, str, int, str, int, float, bool, int],
+) -> tuple[int, np.ndarray, int, str]:
+    index, path, label, rel_path, resolution, padding_voxels, fill_interior, surface_dilation = task
+    voxels = voxelize_off(
+        Path(path),
+        resolution=resolution,
+        padding_voxels=padding_voxels,
+        fill_interior=fill_interior,
+        surface_dilation=surface_dilation,
+    )
+    return index, voxels, label, rel_path
 
 
 def voxelize_off(

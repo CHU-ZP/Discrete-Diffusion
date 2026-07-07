@@ -16,7 +16,7 @@ class ResidualBlock3D(nn.Module):
         super().__init__()
         self.norm1 = nn.GroupNorm(_group_count(in_channels), in_channels)
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.cond = nn.Linear(cond_dim, out_channels)
+        self.cond = nn.Linear(cond_dim, out_channels * 2)
         self.norm2 = nn.GroupNorm(_group_count(out_channels), out_channels)
         self.dropout = nn.Dropout3d(dropout)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
@@ -28,8 +28,11 @@ class ResidualBlock3D(nn.Module):
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.cond(F.silu(cond)).view(cond.shape[0], -1, 1, 1, 1)
-        h = self.conv2(self.dropout(F.silu(self.norm2(h))))
+        scale, shift = self.cond(F.silu(cond)).chunk(2, dim=1)
+        h = self.norm2(h)
+        h = h * (1.0 + scale.view(cond.shape[0], -1, 1, 1, 1))
+        h = h + shift.view(cond.shape[0], -1, 1, 1, 1)
+        h = self.conv2(self.dropout(F.silu(h)))
         return h + self.skip(x)
 
 
@@ -165,9 +168,7 @@ class UNet3D(nn.Module):
 
         cond = self.time_embedding(t)
         if self.class_embedding is not None:
-            if y is None:
-                raise ValueError("Conditional model requires y labels.")
-            cond = cond + self.class_embedding(y)
+            cond = cond + self._class_condition(y, cond)
 
         h = self.token_embedding(x_t).permute(0, 4, 1, 2, 3).contiguous()
         h = self.input(h)
@@ -196,6 +197,19 @@ class UNet3D(nn.Module):
                 h = self.upsamples[level](h)
 
         return self.output(F.silu(self.output_norm(h)))
+
+    def _class_condition(self, y: torch.Tensor | None, cond: torch.Tensor) -> torch.Tensor:
+        class_cond = torch.zeros_like(cond)
+        if y is None:
+            return class_cond
+
+        y = y.to(device=cond.device, dtype=torch.long)
+        if y.ndim == 0:
+            y = y.expand(cond.shape[0])
+        valid = y >= 0
+        if torch.any(valid):
+            class_cond[valid] = self.class_embedding(y[valid])
+        return class_cond
 
 
 def _group_count(channels: int) -> int:

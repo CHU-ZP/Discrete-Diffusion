@@ -1,6 +1,6 @@
 # discrete-diffusion-demo
 
-A small standalone PyTorch project for categorical diffusion on discrete image data. The main runnable path trains a class-conditional MNIST generator with a CNN denoiser.
+A small standalone PyTorch project for categorical diffusion on discrete image and voxel data. The runnable paths train a class-conditional MNIST generator with a CNN denoiser and a ModelNet10 voxel generator with a 3D U-Net denoiser.
 
 MNIST images are quantized into integer categories before diffusion. The default config uses 32 pixel categories, so each image is a `[28, 28]` grid of tokens in `{0, ..., 31}`. The model predicts `p_theta(x_0 | x_t, t, y)` as per-pixel categorical logits.
 
@@ -18,9 +18,8 @@ The code is organized around:
 
 ```text
 MNIST dataset -> CNN2D denoiser -> categorical diffusion engine
+ModelNet10 OFF meshes -> 64^3 voxel cache -> UNet3D denoiser -> categorical diffusion engine
 ```
-
-The ModelNet10 voxel path remains scaffolded for later experiments, but it is not the active path.
 
 ## Install
 
@@ -74,13 +73,13 @@ You can also use the helper scripts:
 
 ## Prepare ModelNet10 Voxels
 
-The voxel path is configured in `configs/voxel_modelnet10.yaml`. The preparation script reads ModelNet10 `.off` meshes, selects the 4 most frequent object classes, normalizes each mesh into a shared cube, voxelizes it at `32x32x32`, flood-fills closed interiors when possible, and writes a cached `.npz`.
+The voxel path is configured in `configs/voxel_modelnet10.yaml`. The preparation script reads ModelNet10 `.off` meshes, selects the 4 most frequent object classes, normalizes each mesh into a shared cube, voxelizes it at `64x64x64`, flood-fills closed interiors when possible, and writes a cached `.npz`.
 
 ```bash
 uv run python scripts/prepare_modelnet_voxels.py \
   --input data/ModelNet10 \
-  --output data/modelnet10_voxel_32_top4.npz \
-  --resolution 32 \
+  --output data/modelnet10_voxel_64_top4.npz \
+  --resolution 64 \
   --num-model-classes 4 \
   --overwrite
 ```
@@ -88,9 +87,9 @@ uv run python scripts/prepare_modelnet_voxels.py \
 The output cache contains:
 
 ```text
-train_x: uint8 [N, 32, 32, 32], values 0 empty / 1 occupied
+train_x: uint8 [N, 64, 64, 64], values 0 empty / 1 occupied
 train_y: int64 [N], labels remapped to 0..3
-test_x:  uint8 [N, 32, 32, 32]
+test_x:  uint8 [N, 64, 64, 64]
 test_y:  int64 [N]
 class_names: selected ModelNet class names in label order
 ```
@@ -127,3 +126,15 @@ train:
 ```
 
 With `auto`, the training script counts voxel token frequencies in the train split and up-weights rare tokens. For binary occupancy this gives occupied voxels a larger loss weight than empty voxels, which helps counter the strong empty/occupied imbalance without changing the diffusion transition process.
+
+Voxel training uses classifier-free guidance support:
+
+```yaml
+train:
+  class_dropout_prob: 0.15
+
+sampling:
+  guidance_scale: 2.0
+```
+
+During training, a fraction of class labels are replaced with a null label so the same model learns both conditional and unconditional denoising. During sampling, conditional logits are guided by unconditional logits to strengthen class-specific shapes.

@@ -71,9 +71,7 @@ class CNN2DDenoiser(nn.Module):
 
         cond = self.time_embedding(t)
         if self.class_embedding is not None:
-            if y is None:
-                raise ValueError("Conditional model requires y labels.")
-            cond = cond + self.class_embedding(y)
+            cond = cond + self._class_condition(y, cond)
 
         h = self.token_embedding(x_t).permute(0, 3, 1, 2).contiguous()
         h = self.input(h)
@@ -81,6 +79,19 @@ class CNN2DDenoiser(nn.Module):
         for block in self.blocks:
             h = block(h, cond)
         return self.output(torch.nn.functional.silu(self.output_norm(h)))
+
+    def _class_condition(self, y: torch.Tensor | None, cond: torch.Tensor) -> torch.Tensor:
+        class_cond = torch.zeros_like(cond)
+        if y is None:
+            return class_cond
+
+        y = y.to(device=cond.device, dtype=torch.long)
+        if y.ndim == 0:
+            y = y.expand(cond.shape[0])
+        valid = y >= 0
+        if torch.any(valid):
+            class_cond[valid] = self.class_embedding(y[valid])
+        return class_cond
 
 
 def _group_count(channels: int) -> int:
