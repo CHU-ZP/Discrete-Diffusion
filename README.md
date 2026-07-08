@@ -99,7 +99,7 @@ You can also use the helper scripts:
 The voxel path is configured in `configs/voxel_modelnet10.yaml`. The full workflow is:
 
 ```text
-download ModelNet10.zip -> extract OFF meshes -> build 64^3 voxel cache -> train UNet3D -> sample and inspect results
+download ModelNet10.zip -> extract OFF meshes -> build 64^3 voxel cache -> train classifier -> cluster subtypes -> train UNet3D -> sample and inspect results
 ```
 
 Download the official Princeton ModelNet10 zip and extract it under `data/`:
@@ -150,7 +150,52 @@ test_y:  int64 [N]
 class_names: selected ModelNet class names in label order
 ```
 
-In the voxel config, `dataset.num_classes: 2` means voxel token classes, while `dataset.num_labels: 4` means the selected object classes used for conditional generation.
+In the base voxel cache, `train_y` / `test_y` are the original top-4 ModelNet class labels. These labels are used to train a supervised 3D CNN classifier whose embedding space is then clustered inside each original class.
+
+Train the voxel classifier:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/train_voxel_classifier.py \
+  --cache data/modelnet10_voxel_64_top4.npz \
+  --output-dir runs/voxel_classifier_top4 \
+  --epochs 30 \
+  --batch-size 16
+```
+
+Build the subtype cache from classifier embeddings. By default this creates 3 subtypes per original class, for 12 total subtype conditioning labels:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/build_modelnet_subtypes.py \
+  --input data/modelnet10_voxel_64_top4.npz \
+  --classifier runs/voxel_classifier_top4/best.pt \
+  --output data/modelnet10_voxel_64_top4_subtypes.npz \
+  --subtypes-per-class 3 \
+  --batch-size 16 \
+  --overwrite
+```
+
+You can use class-specific subtype counts, for example:
+
+```bash
+uv run python scripts/build_modelnet_subtypes.py \
+  --input data/modelnet10_voxel_64_top4.npz \
+  --classifier runs/voxel_classifier_top4/best.pt \
+  --output data/modelnet10_voxel_64_top4_subtypes.npz \
+  --subtypes-per-class 4,2,2,3 \
+  --overwrite
+```
+
+The subtype cache uses:
+
+```text
+train_y: subtype labels used for diffusion conditioning
+train_class_y: original top-4 ModelNet class labels
+train_subtype_y: class-local subtype id
+subtype_names: readable subtype names, e.g. chair_0
+subtype_counts: empirical train-set subtype counts for prior sampling
+```
+
+In the diffusion config, `dataset.num_classes: 2` means voxel token classes, while `dataset.num_labels: 12` means the subtype labels used for conditional generation. Voxel diffusion is trained as a pure subtype-conditioned model without a null-label branch.
 
 Start a detachable training session with `tmux`:
 
@@ -177,8 +222,8 @@ Monitor training:
 ```bash
 tail -f train_voxel64.log
 watch -n 2 nvidia-smi
-ls -lh runs/voxel_modelnet10_64/
-ls -lh outputs/voxel_modelnet10_64/
+ls -lh runs/voxel_modelnet10_64_subtypes/
+ls -lh outputs/voxel_modelnet10_64_subtypes/
 ```
 
 Generate samples from the latest checkpoint:
@@ -186,20 +231,41 @@ Generate samples from the latest checkpoint:
 ```bash
 uv run python -m ddiff.sample \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --num-samples 12
+```
+
+When `--labels` is omitted for a ModelNet subtype cache, sampling first draws subtype labels from `subtype_counts`, then generates conditioned on those subtype labels. To inspect every subtype once, use:
+
+```bash
+uv run python -m ddiff.sample \
+  --config configs/voxel_modelnet10.yaml \
+  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
   --labels all \
-  --num-samples 4 \
-  --guidance-scale 2.0
+  --num-samples 12
+```
+
+To sample subtypes belonging to one original class, use the class name or class id:
+
+```bash
+uv run python -m ddiff.sample \
+  --config configs/voxel_modelnet10.yaml \
+  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --classes monitor \
+  --num-samples 8
 ```
 
 Training and sampling write:
 
 ```text
-runs/voxel_modelnet10_64/latest.pt
-runs/voxel_modelnet10_64/step_*.pt
-outputs/voxel_modelnet10_64/real_voxels.png
-outputs/voxel_modelnet10_64/generated_voxels_step_*.png
-outputs/voxel_modelnet10_64/generated_voxels.png
+runs/voxel_classifier_top4/best.pt
+data/modelnet10_voxel_64_top4_subtypes.npz
+data/modelnet10_voxel_64_top4_subtypes_manifest.csv
+runs/voxel_modelnet10_64_subtypes/latest.pt
+runs/voxel_modelnet10_64_subtypes/step_*.pt
+outputs/voxel_modelnet10_64_subtypes/real_voxels.png
+outputs/voxel_modelnet10_64_subtypes/generated_voxels_step_*.png
+outputs/voxel_modelnet10_64_subtypes/generated_voxels.png
 ```
 
 To inspect the generated voxel cache, open:
@@ -214,9 +280,12 @@ The voxel files are:
 
 ```text
 scripts/prepare_modelnet_voxels.py
+scripts/train_voxel_classifier.py
+scripts/build_modelnet_subtypes.py
 configs/voxel_modelnet10.yaml
 notebooks/visualize_voxels.ipynb
 src/ddiff/data/modelnet_voxel.py
+src/ddiff/models/voxel_classifier.py
 src/ddiff/models/unet3d.py
 src/ddiff/visualization/voxels.py
 ```
@@ -232,15 +301,3 @@ train:
 ```
 
 With `auto`, the training script counts voxel token frequencies in the train split and up-weights rare tokens. For binary occupancy this gives occupied voxels a larger loss weight than empty voxels, which helps counter the strong empty/occupied imbalance without changing the diffusion transition process.
-
-Voxel training uses classifier-free guidance support:
-
-```yaml
-train:
-  class_dropout_prob: 0.15
-
-sampling:
-  guidance_scale: 2.0
-```
-
-During training, a fraction of class labels are replaced with a null label so the same model learns both conditional and unconditional denoising. During sampling, conditional logits are guided by unconditional logits to strengthen class-specific shapes.

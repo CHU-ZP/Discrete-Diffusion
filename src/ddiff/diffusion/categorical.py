@@ -132,7 +132,6 @@ class CategoricalDiffusion:
         return_chain: bool = False,
         chain_steps: Iterable[int] | None = None,
         device: torch.device | str | None = None,
-        guidance_scale: float = 1.0,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
         """Sample from p_theta by iterating the learned reverse chain."""
 
@@ -171,7 +170,7 @@ class CategoricalDiffusion:
 
         for t_int in range(self.timesteps, 0, -1):
             t = torch.full((sample_shape[0],), t_int, device=device, dtype=torch.long)
-            logits = self._guided_logits(model, x_t, t, y, float(guidance_scale))
+            logits = model(x_t, t, y)
             x_t = self._sample_previous_from_logits(x_t, logits, t_int)
             if return_chain and (t_int - 1) in chain_step_set:
                 chain[t_int - 1] = x_t.detach().cpu()
@@ -209,21 +208,6 @@ class CategoricalDiffusion:
 
         sampled = torch.multinomial(posterior, num_samples=1).reshape(batch, *spatial_shape)
         return sampled
-
-    def _guided_logits(
-        self,
-        model: torch.nn.Module,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        y: torch.Tensor | None,
-        guidance_scale: float,
-    ) -> torch.Tensor:
-        if y is None or guidance_scale == 1.0:
-            return model(x_t, t, y)
-
-        logits_cond = model(x_t, t, y)
-        logits_uncond = model(x_t, t, None)
-        return logits_uncond + guidance_scale * (logits_cond - logits_uncond)
 
     def _ensure_device(self, device: torch.device | str) -> None:
         device = torch.device(device)

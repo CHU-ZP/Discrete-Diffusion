@@ -6,9 +6,10 @@ dataset:
   num_classes: 2
   shape: [64, 64, 64]
   conditional: true
-  # ModelNet object classes: the 4 most frequent classes are selected by the preparation script.
-  num_labels: 4
-  cache_path: data/modelnet10_voxel_64_top4.npz
+  # Conditional labels are subtype ids produced by scripts/build_modelnet_subtypes.py.
+  # The default subtype recipe uses 3 subtypes for each of the 4 original ModelNet classes.
+  num_labels: 12
+  cache_path: data/modelnet10_voxel_64_top4_subtypes.npz
 
 diffusion:
   timesteps: 100
@@ -29,20 +30,16 @@ train:
   steps: 50000
   lr: 0.0002
   weight_decay: 0.01
-  class_dropout_prob: 0.15
   # Automatically up-weight rare voxel tokens. For binary occupancy this raises
   # the occupied class loss relative to the dominant empty class.
   token_loss_weights: auto
   max_token_loss_weight: 8.0
   log_every: 100
   sample_every: 1000
-  sample_batch_size: 4
+  sample_batch_size: 12
   num_workers: 2
   device: auto
 
-sampling:
-  guidance_scale: 2.0
-
 output:
-  run_dir: runs/voxel_modelnet10_64
-  sample_dir: outputs/voxel_modelnet10_64
+  run_dir: runs/voxel_modelnet10_64_subtypes
+  sample_dir: outputs/voxel_modelnet10_64_subtypes

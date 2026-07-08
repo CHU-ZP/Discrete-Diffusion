@@ -199,17 +199,13 @@ class UNet3D(nn.Module):
         return self.output(F.silu(self.output_norm(h)))
 
     def _class_condition(self, y: torch.Tensor | None, cond: torch.Tensor) -> torch.Tensor:
-        class_cond = torch.zeros_like(cond)
         if y is None:
-            return class_cond
+            raise ValueError("Conditional model requires y labels.")
 
         y = y.to(device=cond.device, dtype=torch.long)
         if y.ndim == 0:
             y = y.expand(cond.shape[0])
-        valid = y >= 0
-        if torch.any(valid):
-            class_cond[valid] = self.class_embedding(y[valid])
-        return class_cond
+        return self.class_embedding(y)
 
 
 def _group_count(channels: int) -> int:

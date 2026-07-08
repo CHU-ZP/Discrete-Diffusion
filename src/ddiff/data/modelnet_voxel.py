@@ -26,6 +26,21 @@ class ModelNetVoxelDataset(Dataset):
             )
 
         data = np.load(self.cache_path, allow_pickle=False)
+        self.metadata = {
+            key: data[key]
+            for key in data.files
+            if key.startswith("subtype_")
+            or key
+            in {
+                "class_names",
+                "class_counts",
+                "resolution",
+                "voxel_token_classes",
+                "num_model_classes",
+                "filled_interiors",
+                "surface_dilation",
+            }
+        }
         if f"{split}_x" in data:
             x = data[f"{split}_x"]
             y = data[f"{split}_y"] if f"{split}_y" in data else None
