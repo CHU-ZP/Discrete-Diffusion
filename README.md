@@ -290,7 +290,12 @@ shows the initial noise, every recorded reverse-diffusion step, the raw result,
 the connected-component detection frame with removable fragments in red, and
 the filtered result. By default every diffusion step is recorded; use
 `--frame-stride 5` for a smaller and faster GIF or `--output path/to/file.gif`
-to select the destination.
+to select the destination. Frames use opaque voxel cube faces rather than a
+point cloud, preserve the tensor axis order used by `save_voxel_grid`, and use
+the same default view (`elev=30`, `azim=-60`). Diffusion frames render at 32³
+for speed while the final frames render at 64³; these can be changed with
+`--render-resolution` and `--final-render-resolution` without changing the
+model's actual 64³ sampling resolution.
 
 To sample subtypes belonging to one original class, use the class name or class id:
 

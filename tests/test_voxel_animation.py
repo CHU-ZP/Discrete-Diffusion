@@ -9,9 +9,10 @@ import torch
 from PIL import Image
 
 from scripts.sample_voxel_animation import (
+    _downsample_volume,
+    _face_vertices,
     _render_frame,
     _resolve_label,
-    _surface_voxels,
 )
 
 
@@ -23,11 +24,23 @@ class VoxelAnimationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown subtype"):
             _resolve_label("bed_0", names)
 
-    def test_surface_extraction_removes_solid_interior(self) -> None:
-        occupied = np.ones((3, 3, 3), dtype=bool)
-        surface = _surface_voxels(occupied)
-        self.assertEqual(int(surface.sum()), 26)
-        self.assertFalse(surface[1, 1, 1])
+    def test_cube_faces_preserve_tensor_axis_order(self) -> None:
+        coordinate = np.asarray([[1, 2, 3]])
+        x_face = _face_vertices(coordinate, axis=0, sign=1)[0]
+        z_face = _face_vertices(coordinate, axis=2, sign=1)[0]
+
+        self.assertEqual(set(x_face[:, 0].tolist()), {2.0})
+        self.assertEqual(set(x_face[:, 1].tolist()), {2.0, 3.0})
+        self.assertEqual(set(x_face[:, 2].tolist()), {3.0, 4.0})
+        self.assertEqual(set(z_face[:, 0].tolist()), {1.0, 2.0})
+        self.assertEqual(set(z_face[:, 2].tolist()), {4.0})
+
+    def test_noise_downsampling_preserves_shape_and_discrete_values(self) -> None:
+        values = np.zeros((64, 64, 64), dtype=np.uint8)
+        values[::2, ::2, ::2] = 1
+        downsampled = _downsample_volume(values, 32)
+        self.assertEqual(downsampled.shape, (32, 32, 32))
+        self.assertTrue(set(np.unique(downsampled)).issubset({0, 1}))
 
     def test_rendered_frames_can_be_written_as_gif(self) -> None:
         raw = torch.zeros((8, 8, 8), dtype=torch.long)
@@ -38,16 +51,31 @@ class VoxelAnimationTests(unittest.TestCase):
         removed = raw.bool() & ~filtered.bool()
 
         frames = [
-            _render_frame(raw, title="raw", max_points=1000, elev=24, azim=38),
+            _render_frame(
+                raw,
+                title="raw",
+                render_resolution=8,
+                image_size=320,
+                elev=30,
+                azim=-60,
+            ),
             _render_frame(
                 filtered,
                 removed=removed,
                 title="detected",
-                max_points=1000,
-                elev=24,
-                azim=38,
+                render_resolution=8,
+                image_size=320,
+                elev=30,
+                azim=-60,
             ),
-            _render_frame(filtered, title="filtered", max_points=1000, elev=24, azim=38),
+            _render_frame(
+                filtered,
+                title="filtered",
+                render_resolution=8,
+                image_size=320,
+                elev=30,
+                azim=-60,
+            ),
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "animation.gif"

@@ -2,17 +2,18 @@
 from __future__ import annotations
 
 import argparse
-import io
+import itertools
+import math
+import textwrap
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 from ddiff.data.modelnet_voxel import load_voxel_cache_metadata
@@ -52,13 +53,20 @@ def main() -> None:
         help="How long to hold the raw, detection, and filtered final frames.",
     )
     parser.add_argument(
-        "--max-points",
+        "--render-resolution",
         type=int,
-        default=20_000,
-        help="Maximum rendered surface points per color and frame.",
+        default=32,
+        help="Voxel render resolution for diffusion frames; sampling still runs at the configured resolution.",
     )
-    parser.add_argument("--elev", type=float, default=24.0)
-    parser.add_argument("--azim", type=float, default=38.0)
+    parser.add_argument(
+        "--final-render-resolution",
+        type=int,
+        default=64,
+        help="Voxel render resolution for raw/detection/filtered final frames.",
+    )
+    parser.add_argument("--image-size", type=int, default=640, help="Square GIF frame size in pixels.")
+    parser.add_argument("--elev", type=float, default=30.0)
+    parser.add_argument("--azim", type=float, default=-60.0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -75,8 +83,10 @@ def main() -> None:
         raise ValueError("--fps must be positive.")
     if args.hold_seconds < 0:
         raise ValueError("--hold-seconds must be non-negative.")
-    if args.max_points <= 0:
-        raise ValueError("--max-points must be positive.")
+    if args.render_resolution <= 0 or args.final_render_resolution <= 0:
+        raise ValueError("Render resolutions must be positive.")
+    if args.image_size < 200:
+        raise ValueError("--image-size must be at least 200.")
 
     cfg = load_config(args.config)
     if cfg["dataset"]["name"] != "modelnet10_voxel":
@@ -153,7 +163,10 @@ def main() -> None:
             _render_frame(
                 chain[step][0],
                 title=f"{label_name} | {stage} | t={step}",
-                max_points=args.max_points,
+                render_resolution=(
+                    args.final_render_resolution if step == 0 else args.render_resolution
+                ),
+                image_size=args.image_size,
                 elev=args.elev,
                 azim=args.azim,
             )
@@ -169,7 +182,8 @@ def main() -> None:
             filtered_result,
             removed=removed,
             title=detection_title,
-            max_points=args.max_points,
+            render_resolution=args.final_render_resolution,
+            image_size=args.image_size,
             elev=args.elev,
             azim=args.azim,
         )
@@ -182,7 +196,8 @@ def main() -> None:
                 f"{label_name} | filtered result | kept={stat.kept_voxels}, "
                 f"removed={stat.removed_voxels}"
             ),
-            max_points=args.max_points,
+            render_resolution=args.final_render_resolution,
+            image_size=args.image_size,
             elev=args.elev,
             azim=args.azim,
         )
@@ -233,7 +248,8 @@ def _render_frame(
     voxels: torch.Tensor,
     *,
     title: str,
-    max_points: int,
+    render_resolution: int,
+    image_size: int,
     elev: float,
     azim: float,
     removed: torch.Tensor | None = None,
@@ -242,73 +258,185 @@ def _render_frame(
     if occupied.ndim != 3:
         raise ValueError(f"Expected one [D, H, W] voxel sample, got {occupied.shape}.")
 
-    fig = plt.figure(figsize=(6, 6))
-    ax = fig.add_subplot(111, projection="3d")
-    _scatter_surface(ax, occupied, color="#2563eb", max_points=max_points, alpha=0.58)
+    values = occupied.astype(np.uint8)
     if removed is not None:
         removed_mask = removed.detach().cpu().numpy().astype(bool)
-        _scatter_surface(ax, removed_mask, color="#ef4444", max_points=max_points, alpha=0.9)
+        if removed_mask.shape != occupied.shape:
+            raise ValueError("removed mask must have the same shape as voxels.")
+        values[removed_mask] = 2
 
-    depth, height, width = occupied.shape
-    ax.set_xlim(-1, width)
-    ax.set_ylim(-1, height)
-    ax.set_zlim(-1, depth)
-    ax.set_box_aspect((width, height, depth))
-    ax.view_init(elev=elev, azim=azim)
-    ax.set_axis_off()
-    ax.set_title(title, fontsize=11, pad=8)
-    fig.tight_layout(pad=0.4)
-
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format="png", dpi=100, facecolor="white")
-    plt.close(fig)
-    buffer.seek(0)
-    with Image.open(buffer) as image:
-        rendered = image.convert("RGB").copy()
-    buffer.close()
-    return rendered
+    values = _downsample_volume(values, render_resolution)
+    return _render_voxel_cubes(
+        values,
+        title=title,
+        image_size=image_size,
+        elev=elev,
+        azim=azim,
+    )
 
 
-def _scatter_surface(
-    ax,
-    occupied: np.ndarray,
+def _downsample_volume(values: np.ndarray, max_resolution: int) -> np.ndarray:
+    """Nearest-neighbor downsampling that preserves occupancy density in noise frames."""
+
+    if max(values.shape) <= max_resolution:
+        return values
+    indices = [
+        np.linspace(0, size - 1, min(size, max_resolution)).round().astype(np.int64)
+        for size in values.shape
+    ]
+    return values[np.ix_(*indices)]
+
+
+def _render_voxel_cubes(
+    values: np.ndarray,
     *,
-    color: str,
-    max_points: int,
-    alpha: float,
-) -> None:
-    surface = _surface_voxels(occupied)
-    coordinates = np.argwhere(surface)
-    if coordinates.shape[0] == 0:
-        return
-    if coordinates.shape[0] > max_points:
-        indices = np.linspace(0, coordinates.shape[0] - 1, max_points, dtype=np.int64)
-        coordinates = coordinates[indices]
-    ax.scatter(
-        coordinates[:, 2],
-        coordinates[:, 1],
-        coordinates[:, 0],
-        c=color,
-        s=2.0,
-        alpha=alpha,
-        linewidths=0,
-        depthshade=True,
+    title: str,
+    image_size: int,
+    elev: float,
+    azim: float,
+) -> Image.Image:
+    """Render opaque voxel cube faces with the same axis order as ``ax.voxels``."""
+
+    occupied = values != 0
+    image = Image.new("RGB", (image_size, image_size), "white")
+    draw = ImageDraw.Draw(image)
+    if not np.any(occupied):
+        _draw_title(draw, title, image_size)
+        return image
+
+    right, up, view = _camera_basis(elev=elev, azim=azim)
+    polygons: list[np.ndarray] = []
+    depths: list[np.ndarray] = []
+    colors: list[np.ndarray] = []
+    shades: list[float] = []
+
+    light = np.asarray((0.45, -0.55, 1.0), dtype=np.float64)
+    light /= np.linalg.norm(light)
+    for axis, sign in itertools.product(range(3), (-1, 1)):
+        normal = np.zeros(3, dtype=np.float64)
+        normal[axis] = sign
+        if float(normal @ view) <= 0.0:
+            continue
+        exposed = _exposed_face_mask(occupied, axis=axis, sign=sign)
+        coordinates = np.argwhere(exposed)
+        if coordinates.shape[0] == 0:
+            continue
+        vertices = _face_vertices(coordinates, axis=axis, sign=sign)
+        polygons.append(np.stack((vertices @ right, vertices @ up), axis=-1))
+        depths.append((vertices @ view).mean(axis=1))
+        colors.append(values[tuple(coordinates.T)])
+        shades.append(0.58 + 0.42 * max(0.0, float(normal @ light)))
+
+    if not polygons:
+        _draw_title(draw, title, image_size)
+        return image
+
+    polygon_array = np.concatenate(polygons, axis=0)
+    depth_array = np.concatenate(depths, axis=0)
+    color_array = np.concatenate(colors, axis=0)
+    shade_array = np.concatenate(
+        [np.full(len(group), shade) for group, shade in zip(polygons, shades)]
     )
+    pixel_polygons = _project_to_pixels(polygon_array, values.shape, right, up, image_size)
+    order = np.argsort(depth_array)
+    base_colors = {
+        1: np.asarray((37, 99, 235), dtype=np.float64),
+        2: np.asarray((239, 68, 68), dtype=np.float64),
+    }
+    for index in order:
+        base = base_colors[int(color_array[index])]
+        fill = tuple(np.clip(base * shade_array[index], 0, 255).astype(np.uint8).tolist())
+        edge = tuple(np.clip(base * shade_array[index] * 0.55, 0, 255).astype(np.uint8).tolist())
+        points = [tuple(point) for point in pixel_polygons[index].round().astype(np.int32)]
+        draw.polygon(points, fill=fill, outline=edge, width=1)
+
+    _draw_title(draw, title, image_size)
+    return image
 
 
-def _surface_voxels(occupied: np.ndarray) -> np.ndarray:
-    padded = np.pad(occupied, 1, mode="constant", constant_values=False)
-    center = padded[1:-1, 1:-1, 1:-1]
-    interior = (
-        center
-        & padded[:-2, 1:-1, 1:-1]
-        & padded[2:, 1:-1, 1:-1]
-        & padded[1:-1, :-2, 1:-1]
-        & padded[1:-1, 2:, 1:-1]
-        & padded[1:-1, 1:-1, :-2]
-        & padded[1:-1, 1:-1, 2:]
+def _camera_basis(*, elev: float, azim: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    elevation = math.radians(elev)
+    azimuth = math.radians(azim)
+    view = np.asarray(
+        (
+            math.cos(elevation) * math.cos(azimuth),
+            math.cos(elevation) * math.sin(azimuth),
+            math.sin(elevation),
+        ),
+        dtype=np.float64,
     )
-    return occupied & ~interior
+    right = np.asarray((-math.sin(azimuth), math.cos(azimuth), 0.0), dtype=np.float64)
+    up = np.cross(view, right)
+    return right, up, view
+
+
+def _exposed_face_mask(occupied: np.ndarray, *, axis: int, sign: int) -> np.ndarray:
+    exposed = occupied.copy()
+    current = [slice(None)] * 3
+    neighbor = [slice(None)] * 3
+    if sign > 0:
+        current[axis] = slice(0, -1)
+        neighbor[axis] = slice(1, None)
+    else:
+        current[axis] = slice(1, None)
+        neighbor[axis] = slice(0, -1)
+    exposed[tuple(current)] &= ~occupied[tuple(neighbor)]
+    return exposed
+
+
+def _face_vertices(coordinates: np.ndarray, *, axis: int, sign: int) -> np.ndarray:
+    """Build cube faces without reordering the tensor's three spatial axes."""
+
+    coordinates = coordinates.astype(np.float64)
+    vertices = np.repeat(coordinates[:, None, :], 4, axis=1)
+    other_axes = [candidate for candidate in range(3) if candidate != axis]
+    vertices[:, :, axis] += 1.0 if sign > 0 else 0.0
+    vertices[:, :, other_axes[0]] += np.asarray((0.0, 1.0, 1.0, 0.0))
+    vertices[:, :, other_axes[1]] += np.asarray((0.0, 0.0, 1.0, 1.0))
+    return vertices
+
+
+def _project_to_pixels(
+    polygons: np.ndarray,
+    shape: tuple[int, ...],
+    right: np.ndarray,
+    up: np.ndarray,
+    image_size: int,
+) -> np.ndarray:
+    corners = np.asarray(list(itertools.product(*((0.0, float(size)) for size in shape))))
+    projected_corners = np.stack((corners @ right, corners @ up), axis=-1)
+    minimum = projected_corners.min(axis=0)
+    maximum = projected_corners.max(axis=0)
+    center = (minimum + maximum) * 0.5
+    span = np.maximum(maximum - minimum, 1e-6)
+    title_height = 64
+    margin = 28
+    available_width = image_size - 2 * margin
+    available_height = image_size - title_height - 2 * margin
+    scale = min(available_width / span[0], available_height / span[1])
+
+    pixels = polygons.copy()
+    pixels[..., 0] = (pixels[..., 0] - center[0]) * scale + image_size * 0.5
+    pixels[..., 1] = (
+        title_height + available_height * 0.5 - (pixels[..., 1] - center[1]) * scale
+    )
+    return pixels
+
+
+def _draw_title(draw: ImageDraw.ImageDraw, title: str, image_size: int) -> None:
+    font_path = Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf"
+    font = ImageFont.truetype(str(font_path), size=max(12, image_size // 38))
+    wrapped = textwrap.fill(title, width=max(36, image_size // 9))
+    bounds = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=2)
+    width = bounds[2] - bounds[0]
+    draw.multiline_text(
+        ((image_size - width) * 0.5, 8),
+        wrapped,
+        fill=(20, 20, 20),
+        font=font,
+        align="center",
+        spacing=2,
+    )
 
 
 if __name__ == "__main__":
