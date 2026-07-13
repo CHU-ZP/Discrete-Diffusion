@@ -13,6 +13,7 @@ from ddiff.data.modelnet_voxel import (
 )
 from ddiff.diffusion.categorical import CategoricalDiffusion
 from ddiff.models.registry import build_model
+from ddiff.postprocessing.voxels import ComponentFilterStats, filter_voxel_components
 from ddiff.utils.config import ensure_dir, load_config, resolve_device
 from ddiff.utils.seed import set_seed
 from ddiff.visualization.images import save_image_grid, save_reverse_chain
@@ -38,6 +39,19 @@ def main() -> None:
         help="Optional comma-separated ModelNet original class ids or names; samples subtypes within those classes.",
     )
     parser.add_argument("--device", default=None, help="Optional device override.")
+    parser.add_argument(
+        "--voxel-component-filter",
+        choices=("largest", "none"),
+        default=None,
+        help="Override voxel connected-component filtering from the config.",
+    )
+    parser.add_argument(
+        "--voxel-connectivity",
+        type=int,
+        choices=(6, 26),
+        default=None,
+        help="Override voxel connectivity used by component filtering.",
+    )
     args = parser.parse_args()
     if args.num_samples <= 0:
         raise ValueError("--num-samples must be positive.")
@@ -45,6 +59,10 @@ def main() -> None:
     cfg = load_config(args.config)
     if args.device is not None:
         cfg["train"]["device"] = args.device
+    if args.voxel_component_filter is not None:
+        cfg.setdefault("sample", {})["voxel_component_filter"] = args.voxel_component_filter
+    if args.voxel_connectivity is not None:
+        cfg.setdefault("sample", {})["voxel_connectivity"] = args.voxel_connectivity
     set_seed(int(cfg.get("seed", 0)))
     device = resolve_device(cfg["train"].get("device", "auto"))
     sample_dir = ensure_dir(cfg["output"]["sample_dir"])
@@ -101,7 +119,15 @@ def main() -> None:
             batch_size=args.num_samples,
             device=device,
         )
-        samples = samples.cpu()
+        raw_samples = samples.cpu()
+        sample_cfg = cfg.get("sample", {})
+        component_filter_mode = str(sample_cfg.get("voxel_component_filter", "largest"))
+        component_connectivity = int(sample_cfg.get("voxel_connectivity", 6))
+        samples, component_stats = filter_voxel_components(
+            raw_samples,
+            mode=component_filter_mode,
+            connectivity=component_connectivity,
+        )
         save_voxel_grid(
             samples,
             sample_dir / "generated_voxels.png",
@@ -114,6 +140,10 @@ def main() -> None:
             labels,
             voxel_label_names,
             sample_dir / "generated_voxels.npz",
+            raw_samples=raw_samples,
+            component_stats=component_stats,
+            component_filter_mode=component_filter_mode,
+            component_connectivity=component_connectivity,
         )
 
     print(f"Saved samples to {Path(sample_dir).resolve()}.")
@@ -248,10 +278,38 @@ def _save_voxel_samples(
     labels: torch.Tensor | None,
     label_names: list[str] | None,
     path: Path,
+    *,
+    raw_samples: torch.Tensor | None = None,
+    component_stats: list[ComponentFilterStats] | None = None,
+    component_filter_mode: str | None = None,
+    component_connectivity: int | None = None,
 ) -> None:
     arrays: dict[str, np.ndarray] = {
         "samples": samples.numpy().astype(np.uint8),
     }
+    if raw_samples is not None:
+        if raw_samples.shape != samples.shape:
+            raise ValueError("raw_samples and filtered samples must have the same shape.")
+        arrays["raw_samples"] = raw_samples.numpy().astype(np.uint8)
+    if component_filter_mode is not None:
+        arrays["component_filter_mode"] = np.asarray(component_filter_mode, dtype="U")
+    if component_connectivity is not None:
+        arrays["component_connectivity"] = np.asarray(component_connectivity, dtype=np.int64)
+    if component_stats is not None:
+        if len(component_stats) != samples.shape[0]:
+            raise ValueError("component_stats must contain one entry per generated sample.")
+        arrays.update(
+            component_counts=np.asarray([stat.components for stat in component_stats], dtype=np.int64),
+            original_voxel_counts=np.asarray(
+                [stat.original_voxels for stat in component_stats], dtype=np.int64
+            ),
+            kept_voxel_counts=np.asarray(
+                [stat.kept_voxels for stat in component_stats], dtype=np.int64
+            ),
+            removed_voxel_counts=np.asarray(
+                [stat.removed_voxels for stat in component_stats], dtype=np.int64
+            ),
+        )
     if labels is not None:
         if label_names is None:
             raise ValueError("Conditional voxel samples require human-readable label names.")
@@ -268,7 +326,13 @@ def _save_voxel_samples(
         )
         print("Generated conditioning labels:")
         for index, (label, name) in enumerate(zip(labels_cpu.tolist(), sample_names)):
-            print(f"  sample {index:03d}: {label} -> {name}")
+            cleanup = ""
+            if component_stats is not None:
+                stat = component_stats[index]
+                cleanup = (
+                    f", components={stat.components}, removed_voxels={stat.removed_voxels}"
+                )
+            print(f"  sample {index:03d}: {label} -> {name}{cleanup}")
     np.savez_compressed(path, **arrays)
 
 

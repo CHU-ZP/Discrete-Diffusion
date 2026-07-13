@@ -13,6 +13,7 @@ from ddiff.data.modelnet_voxel import (
     resolve_voxel_label_names,
     validate_voxel_conditioning_metadata,
 )
+from ddiff.postprocessing.voxels import filter_voxel_components
 from ddiff.sample import (
     _build_conditioning_labels,
     _resolve_sampling_label_names,
@@ -159,16 +160,32 @@ class SamplingLabelTests(unittest.TestCase):
 
     def test_raw_voxel_output_preserves_id_and_name_for_each_sample(self) -> None:
         names = resolve_voxel_label_names(subtype_metadata(), 12)
-        samples = torch.zeros((12, 2, 2, 2), dtype=torch.long)
+        raw_samples = torch.zeros((12, 3, 3, 3), dtype=torch.long)
+        raw_samples[:, 0:2, 0:2, 0:2] = 1
+        raw_samples[:, 2, 2, 2] = 1
+        samples, component_stats = filter_voxel_components(raw_samples)
         labels = torch.arange(12)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "samples.npz"
-            _save_voxel_samples(samples, labels, names, output)
+            _save_voxel_samples(
+                samples,
+                labels,
+                names,
+                output,
+                raw_samples=raw_samples,
+                component_stats=component_stats,
+                component_filter_mode="largest",
+                component_connectivity=6,
+            )
             with np.load(output, allow_pickle=False) as data:
                 self.assertEqual(data["labels"].tolist(), list(range(12)))
                 self.assertEqual(data["sample_label_names"].tolist(), names)
-                self.assertEqual(data["samples"].shape, (12, 2, 2, 2))
+                self.assertEqual(data["samples"].shape, (12, 3, 3, 3))
+                self.assertEqual(data["raw_samples"].shape, (12, 3, 3, 3))
+                self.assertEqual(data["removed_voxel_counts"].tolist(), [1] * 12)
+                self.assertEqual(data["component_filter_mode"].item(), "largest")
+                self.assertEqual(data["component_connectivity"].item(), 6)
 
     def test_checkpoint_preserves_the_training_label_mapping(self) -> None:
         model = torch.nn.Linear(2, 2)

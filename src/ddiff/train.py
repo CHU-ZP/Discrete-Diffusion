@@ -14,6 +14,7 @@ from ddiff.data.modelnet_voxel import resolve_voxel_label_names
 from ddiff.data.registry import build_dataset, collate_samples
 from ddiff.diffusion.categorical import CategoricalDiffusion
 from ddiff.models.registry import build_model
+from ddiff.postprocessing.voxels import filter_voxel_components
 from ddiff.utils.config import ensure_dir, load_config, resolve_device
 from ddiff.utils.seed import set_seed
 from ddiff.visualization.images import save_forward_chain, save_image_grid, save_reverse_chain
@@ -251,8 +252,20 @@ def _save_samples(
             batch_size=batch_size,
             device=device,
         )
-        save_voxel_grid(
+        sample_cfg = cfg.get("sample", {})
+        samples, component_stats = filter_voxel_components(
             samples.cpu(),
+            mode=str(sample_cfg.get("voxel_component_filter", "largest")),
+            connectivity=int(sample_cfg.get("voxel_connectivity", 6)),
+        )
+        removed_voxels = sum(stat.removed_voxels for stat in component_stats)
+        affected_samples = sum(stat.removed_voxels > 0 for stat in component_stats)
+        print(
+            f"Voxel component filter removed {removed_voxels} voxels "
+            f"from {affected_samples}/{batch_size} preview samples."
+        )
+        save_voxel_grid(
+            samples,
             sample_dir / f"generated_voxels_step_{step:06d}.png",
             max_items=batch_size,
             labels=labels,

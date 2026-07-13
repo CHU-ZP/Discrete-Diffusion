@@ -25,6 +25,12 @@ model:
   num_res_blocks: 2
   dropout: 0.1
 
+sample:
+  # Remove disconnected floating fragments after generation by keeping the
+  # largest 6-connected occupied component in each voxel sample.
+  voxel_component_filter: largest
+  voxel_connectivity: 6
+
 train:
   batch_size: 2
   steps: 50000

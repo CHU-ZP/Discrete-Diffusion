@@ -251,6 +251,47 @@ to cover every configured conditioning label. Sampling also writes
 `generated_voxels.npz`, preserving every generated voxel tensor together with
 its numeric id and readable subtype name.
 
+Generated voxels are post-processed with 6-connected component analysis. By
+default only the largest occupied component is retained, removing isolated
+floating voxels and fragments. The NPZ keeps cleaned `samples`, unmodified
+`raw_samples`, and per-sample component/removal statistics. This behavior is
+configured with:
+
+```yaml
+sample:
+  voxel_component_filter: largest
+  voxel_connectivity: 6
+```
+
+For an unfiltered diagnostic sample, override it from the command line:
+
+```bash
+uv run python -m ddiff.sample \
+  --config configs/voxel_modelnet10.yaml \
+  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --labels all \
+  --num-samples 12 \
+  --voxel-component-filter none
+```
+
+### Voxel Reverse-Diffusion GIF
+
+Generate one animation for a conditioning subtype id:
+
+```bash
+uv run python scripts/sample_voxel_animation.py \
+  --config configs/voxel_modelnet10.yaml \
+  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --label 7
+```
+
+`--label` also accepts the exact subtype name, such as `--label bed_1`. The GIF
+shows the initial noise, every recorded reverse-diffusion step, the raw result,
+the connected-component detection frame with removable fragments in red, and
+the filtered result. By default every diffusion step is recorded; use
+`--frame-stride 5` for a smaller and faster GIF or `--output path/to/file.gif`
+to select the destination.
+
 To sample subtypes belonging to one original class, use the class name or class id:
 
 ```bash
@@ -289,6 +330,7 @@ The voxel files are:
 scripts/prepare_modelnet_voxels.py
 scripts/train_voxel_classifier.py
 scripts/build_modelnet_subtypes.py
+scripts/sample_voxel_animation.py
 configs/voxel_modelnet10.yaml
 notebooks/visualize_voxels.ipynb
 src/ddiff/data/modelnet_voxel.py
