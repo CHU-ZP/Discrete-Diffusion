@@ -245,6 +245,12 @@ uv run python -m ddiff.sample \
   --num-samples 12
 ```
 
+The voxel grid titles use the cache's readable `subtype_names` values, such as
+`chair_0`, rather than raw numeric ids. `--labels all` requires enough samples
+to cover every configured conditioning label. Sampling also writes
+`generated_voxels.npz`, preserving every generated voxel tensor together with
+its numeric id and readable subtype name.
+
 To sample subtypes belonging to one original class, use the class name or class id:
 
 ```bash
@@ -266,6 +272,7 @@ runs/voxel_modelnet10_64_subtypes/step_*.pt
 outputs/voxel_modelnet10_64_subtypes/real_voxels.png
 outputs/voxel_modelnet10_64_subtypes/generated_voxels_step_*.png
 outputs/voxel_modelnet10_64_subtypes/generated_voxels.png
+outputs/voxel_modelnet10_64_subtypes/generated_voxels.npz
 ```
 
 To inspect the generated voxel cache, open:

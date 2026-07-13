@@ -10,6 +10,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from ddiff.data.modelnet_voxel import resolve_voxel_label_names
 from ddiff.data.registry import build_dataset, collate_samples
 from ddiff.diffusion.categorical import CategoricalDiffusion
 from ddiff.models.registry import build_model
@@ -42,6 +43,8 @@ def train(cfg: dict[str, Any]) -> None:
     sample_dir = ensure_dir(cfg["output"]["sample_dir"])
 
     dataset = build_dataset(cfg, split="train")
+    _validate_dataset_conditioning(cfg, dataset)
+    conditioning_label_names = _conditioning_label_names(cfg, dataset)
     loader = DataLoader(
         dataset,
         batch_size=int(cfg["train"]["batch_size"]),
@@ -62,11 +65,20 @@ def train(cfg: dict[str, Any]) -> None:
     )
 
     print(f"Training on {device} with {len(dataset)} samples.")
-    _save_initial_visuals(cfg, dataset, diffusion, sample_dir, device)
+    _save_initial_visuals(
+        cfg,
+        dataset,
+        diffusion,
+        sample_dir,
+        device,
+        conditioning_label_names=conditioning_label_names,
+    )
 
     total_steps = int(cfg["train"]["steps"])
     log_every = int(cfg["train"].get("log_every", 100))
     sample_every = int(cfg["train"].get("sample_every", 500))
+    if sample_every <= 0:
+        raise ValueError("train.sample_every must be positive.")
     conditional = bool(cfg["dataset"].get("conditional", False))
     spatial_shape = tuple(cfg["dataset"]["shape"])
 
@@ -88,12 +100,52 @@ def train(cfg: dict[str, Any]) -> None:
             print(f"step {step:06d} loss {last_loss:.4f}")
 
         if step % sample_every == 0:
-            _save_checkpoint(model, optimizer, cfg, step, run_dir / "latest.pt")
-            _save_checkpoint(model, optimizer, cfg, step, run_dir / f"step_{step:06d}.pt")
-            _save_samples(cfg, model, diffusion, sample_dir, spatial_shape, device, step=step)
+            _save_checkpoint(
+                model,
+                optimizer,
+                cfg,
+                step,
+                run_dir / "latest.pt",
+                conditioning_label_names=conditioning_label_names,
+            )
+            _save_checkpoint(
+                model,
+                optimizer,
+                cfg,
+                step,
+                run_dir / f"step_{step:06d}.pt",
+                conditioning_label_names=conditioning_label_names,
+            )
+            _save_samples(
+                cfg,
+                model,
+                diffusion,
+                sample_dir,
+                spatial_shape,
+                device,
+                step=step,
+                conditioning_label_names=conditioning_label_names,
+            )
 
-    _save_checkpoint(model, optimizer, cfg, total_steps, run_dir / "latest.pt")
-    _save_samples(cfg, model, diffusion, sample_dir, spatial_shape, device, step=total_steps)
+    _save_checkpoint(
+        model,
+        optimizer,
+        cfg,
+        total_steps,
+        run_dir / "latest.pt",
+        conditioning_label_names=conditioning_label_names,
+    )
+    if total_steps % sample_every != 0:
+        _save_samples(
+            cfg,
+            model,
+            diffusion,
+            sample_dir,
+            spatial_shape,
+            device,
+            step=total_steps,
+            conditioning_label_names=conditioning_label_names,
+        )
     if last_loss is not None:
         print(f"Finished training at step {total_steps} with loss {last_loss:.4f}.")
 
@@ -104,17 +156,19 @@ def _save_checkpoint(
     cfg: dict[str, Any],
     step: int,
     path: Path,
+    *,
+    conditioning_label_names: list[str] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": cfg,
-            "step": step,
-        },
-        path,
-    )
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": cfg,
+        "step": step,
+    }
+    if conditioning_label_names is not None:
+        checkpoint["conditioning_label_names"] = list(conditioning_label_names)
+    torch.save(checkpoint, path)
 
 
 @torch.no_grad()
@@ -124,6 +178,8 @@ def _save_initial_visuals(
     diffusion: CategoricalDiffusion,
     sample_dir: Path,
     device: torch.device,
+    *,
+    conditioning_label_names: list[str] | None = None,
 ) -> None:
     count = min(64, len(dataset))
     examples = [dataset[idx] for idx in range(count)]
@@ -144,7 +200,12 @@ def _save_initial_visuals(
         save_forward_chain(chain, sample_dir / "forward_chain.png", value_range=value_range)
     elif cfg["dataset"]["name"] == "modelnet10_voxel":
         labels = _example_labels(examples) if bool(cfg["dataset"].get("conditional", False)) else None
-        save_voxel_grid(x, sample_dir / "real_voxels.png", labels=labels)
+        save_voxel_grid(
+            x,
+            sample_dir / "real_voxels.png",
+            labels=labels,
+            label_names=conditioning_label_names,
+        )
 
 
 @torch.no_grad()
@@ -157,6 +218,7 @@ def _save_samples(
     device: torch.device,
     *,
     step: int,
+    conditioning_label_names: list[str] | None = None,
 ) -> None:
     name = cfg["dataset"]["name"]
     if _is_image_dataset(cfg):
@@ -192,7 +254,9 @@ def _save_samples(
         save_voxel_grid(
             samples.cpu(),
             sample_dir / f"generated_voxels_step_{step:06d}.png",
+            max_items=batch_size,
             labels=labels,
+            label_names=conditioning_label_names,
         )
 
 
@@ -201,6 +265,48 @@ def _example_labels(examples: list[dict[str, torch.Tensor | None]]) -> torch.Ten
     if any(label is None for label in labels):
         return None
     return torch.stack([label for label in labels if label is not None]).long()
+
+
+def _validate_dataset_conditioning(cfg: dict[str, Any], dataset) -> None:
+    if not bool(cfg["dataset"].get("conditional", False)):
+        return
+
+    num_labels = int(cfg["dataset"].get("num_labels", 0))
+    if num_labels <= 0:
+        raise ValueError("Conditional training requires dataset.num_labels > 0.")
+    labels = getattr(dataset, "y", None)
+    if labels is None:
+        raise ValueError("Conditional training requires a label for every dataset sample.")
+
+    labels = torch.as_tensor(labels).reshape(-1).long()
+    if labels.numel() != len(dataset):
+        raise ValueError(f"Dataset has {len(dataset)} samples but {labels.numel()} labels.")
+    if labels.numel() == 0:
+        raise ValueError("Cannot train on an empty conditional dataset.")
+    if int(labels.min()) < 0 or int(labels.max()) >= num_labels:
+        raise ValueError(
+            f"Dataset labels must be in [0, {num_labels - 1}], got "
+            f"[{int(labels.min())}, {int(labels.max())}]."
+        )
+
+    present = set(int(label) for label in labels.unique().tolist())
+    missing = sorted(set(range(num_labels)) - present)
+    if missing:
+        raise ValueError(
+            f"The training split has no samples for conditioning labels {missing}. "
+            "Sampling these labels would use untrained conditions."
+        )
+
+
+def _conditioning_label_names(cfg: dict[str, Any], dataset) -> list[str] | None:
+    if cfg["dataset"]["name"] != "modelnet10_voxel":
+        return None
+    if not bool(cfg["dataset"].get("conditional", False)):
+        return None
+
+    num_labels = int(cfg["dataset"]["num_labels"])
+    metadata = getattr(dataset, "metadata", {})
+    return resolve_voxel_label_names(metadata, num_labels)
 
 
 def _build_token_loss_weights(

@@ -6,6 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from ddiff.data.modelnet_voxel import (
+    load_voxel_cache_metadata,
+    resolve_voxel_label_names,
+    validate_voxel_conditioning_metadata,
+)
 from ddiff.diffusion.categorical import CategoricalDiffusion
 from ddiff.models.registry import build_model
 from ddiff.utils.config import ensure_dir, load_config, resolve_device
@@ -46,12 +51,29 @@ def main() -> None:
 
     model = build_model(cfg).to(device)
     checkpoint = torch.load(args.ckpt, map_location=device)
+    _validate_checkpoint_sampling_config(cfg, checkpoint)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     diffusion = CategoricalDiffusion.from_config(cfg, device=device)
 
     spatial_shape = tuple(cfg["dataset"]["shape"])
-    labels = _build_conditioning_labels(cfg, args.num_samples, args.labels, args.classes, device)
+    voxel_metadata: dict[str, np.ndarray] | None = None
+    voxel_label_names: list[str] | None = None
+    if cfg["dataset"]["name"] == "modelnet10_voxel" and bool(
+        cfg["dataset"].get("conditional", False)
+    ):
+        num_labels = int(cfg["dataset"].get("num_labels", 0))
+        voxel_metadata = load_voxel_cache_metadata(cfg["dataset"]["cache_path"])
+        voxel_label_names = _resolve_sampling_label_names(checkpoint, voxel_metadata, num_labels)
+
+    labels = _build_conditioning_labels(
+        cfg,
+        args.num_samples,
+        args.labels,
+        args.classes,
+        device,
+        voxel_metadata=voxel_metadata,
+    )
 
     if cfg["dataset"]["name"] == "mnist":
         samples, chain = diffusion.sample(
@@ -79,7 +101,20 @@ def main() -> None:
             batch_size=args.num_samples,
             device=device,
         )
-        save_voxel_grid(samples.cpu(), sample_dir / "generated_voxels.png", labels=labels)
+        samples = samples.cpu()
+        save_voxel_grid(
+            samples,
+            sample_dir / "generated_voxels.png",
+            max_items=args.num_samples,
+            labels=labels,
+            label_names=voxel_label_names,
+        )
+        _save_voxel_samples(
+            samples,
+            labels,
+            voxel_label_names,
+            sample_dir / "generated_voxels.npz",
+        )
 
     print(f"Saved samples to {Path(sample_dir).resolve()}.")
 
@@ -90,6 +125,8 @@ def _build_conditioning_labels(
     labels_arg: str | None,
     classes_arg: str | None,
     device: torch.device,
+    *,
+    voxel_metadata: dict[str, np.ndarray] | None = None,
 ) -> torch.Tensor | None:
     conditional = bool(cfg["dataset"].get("conditional", False))
     if (labels_arg is not None or classes_arg is not None) and not conditional:
@@ -102,7 +139,10 @@ def _build_conditioning_labels(
         raise ValueError("Conditional sampling requires dataset.num_labels > 0.")
 
     if cfg["dataset"]["name"] == "modelnet10_voxel":
-        metadata = _load_voxel_cache_metadata(cfg)
+        metadata = voxel_metadata
+        if metadata is None:
+            metadata = load_voxel_cache_metadata(cfg["dataset"]["cache_path"])
+        validate_voxel_conditioning_metadata(metadata, num_labels)
         if classes_arg is not None:
             return _sample_subtypes_for_classes(metadata, classes_arg, num_samples, num_labels, device)
         if labels_arg is None or labels_arg.strip().lower() == "prior":
@@ -111,6 +151,11 @@ def _build_conditioning_labels(
                 return _sample_labels_from_prior(prior, num_samples, num_labels, device)
 
     requested = _parse_labels_arg(labels_arg, num_labels)
+    if num_samples < len(requested):
+        raise ValueError(
+            f"--num-samples={num_samples} cannot cover all {len(requested)} requested labels. "
+            "Increase --num-samples or request fewer labels."
+        )
     repeats = (num_samples + len(requested) - 1) // len(requested)
     labels = (requested * repeats)[:num_samples]
     return torch.tensor(labels, device=device, dtype=torch.long)
@@ -135,12 +180,96 @@ def _parse_labels_arg(labels_arg: str | None, num_labels: int) -> list[int]:
     return labels
 
 
-def _load_voxel_cache_metadata(cfg: dict) -> dict[str, np.ndarray]:
-    cache_path = Path(cfg["dataset"]["cache_path"])
-    if not cache_path.exists():
-        return {}
-    data = np.load(cache_path, allow_pickle=False)
-    return {key: data[key] for key in data.files if key.startswith("subtype_") or key == "class_names"}
+def _resolve_sampling_label_names(
+    checkpoint: dict,
+    metadata: dict[str, np.ndarray],
+    num_labels: int,
+) -> list[str]:
+    checkpoint_names = checkpoint.get("conditioning_label_names")
+    if checkpoint_names is not None:
+        checkpoint_names = [str(name) for name in checkpoint_names]
+        if len(checkpoint_names) != num_labels:
+            raise ValueError(
+                f"Checkpoint contains {len(checkpoint_names)} conditioning label names, "
+                f"but dataset.num_labels={num_labels}."
+            )
+
+    cache_names = resolve_voxel_label_names(metadata, num_labels)
+    if checkpoint_names is not None and checkpoint_names != cache_names:
+        raise ValueError(
+            "The checkpoint and voxel cache use different conditioning-label mappings. "
+            "Use the same subtype cache that was used for training."
+        )
+    return checkpoint_names if checkpoint_names is not None else cache_names
+
+
+def _validate_checkpoint_sampling_config(cfg: dict, checkpoint: dict) -> None:
+    checkpoint_cfg = checkpoint.get("config")
+    if not isinstance(checkpoint_cfg, dict):
+        return
+
+    checks = (
+        ("dataset", "name"),
+        ("dataset", "num_classes"),
+        ("dataset", "num_labels"),
+        ("dataset", "shape"),
+        ("dataset", "conditional"),
+        ("diffusion", "timesteps"),
+        ("diffusion", "schedule"),
+        ("diffusion", "beta_start"),
+        ("diffusion", "beta_end"),
+        ("diffusion", "transition"),
+        ("model", "name"),
+    )
+    mismatches: list[str] = []
+    for section, key in checks:
+        current = cfg.get(section, {}).get(key)
+        trained = checkpoint_cfg.get(section, {}).get(key)
+        if current != trained:
+            mismatches.append(f"{section}.{key}: checkpoint={trained!r}, config={current!r}")
+
+    current_cache = cfg.get("dataset", {}).get("cache_path")
+    trained_cache = checkpoint_cfg.get("dataset", {}).get("cache_path")
+    if current_cache is not None and trained_cache is not None and current_cache != trained_cache:
+        mismatches.append(
+            f"dataset.cache_path: checkpoint={trained_cache!r}, config={current_cache!r}"
+        )
+
+    if mismatches:
+        details = "\n  ".join(mismatches)
+        raise ValueError(
+            "Sampling config does not match the checkpoint training config:\n  "
+            f"{details}"
+        )
+
+
+def _save_voxel_samples(
+    samples: torch.Tensor,
+    labels: torch.Tensor | None,
+    label_names: list[str] | None,
+    path: Path,
+) -> None:
+    arrays: dict[str, np.ndarray] = {
+        "samples": samples.numpy().astype(np.uint8),
+    }
+    if labels is not None:
+        if label_names is None:
+            raise ValueError("Conditional voxel samples require human-readable label names.")
+        labels_cpu = labels.detach().cpu().reshape(-1)
+        if labels_cpu.shape[0] != samples.shape[0]:
+            raise ValueError(
+                f"Generated {samples.shape[0]} samples but received {labels_cpu.shape[0]} labels."
+            )
+        sample_names = [label_names[int(label)] for label in labels_cpu.tolist()]
+        arrays.update(
+            labels=labels_cpu.numpy().astype(np.int64),
+            sample_label_names=np.asarray(sample_names, dtype="U"),
+            conditioning_label_names=np.asarray(label_names, dtype="U"),
+        )
+        print("Generated conditioning labels:")
+        for index, (label, name) in enumerate(zip(labels_cpu.tolist(), sample_names)):
+            print(f"  sample {index:03d}: {label} -> {name}")
+    np.savez_compressed(path, **arrays)
 
 
 def _sample_labels_from_prior(

@@ -1,10 +1,73 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+def load_voxel_cache_metadata(cache_path: str | Path) -> dict[str, np.ndarray]:
+    """Load the label metadata needed for conditioned voxel sampling."""
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return {}
+    with np.load(cache_path, allow_pickle=False) as data:
+        return {
+            key: data[key]
+            for key in data.files
+            if key.startswith("subtype_") or key == "class_names"
+        }
+
+
+def validate_voxel_conditioning_metadata(
+    metadata: Mapping[str, np.ndarray],
+    num_labels: int,
+) -> None:
+    """Ensure every subtype-level metadata array uses the configured label order."""
+
+    label_level_keys = (
+        "subtype_names",
+        "subtype_class_ids",
+        "subtype_local_ids",
+        "subtype_counts",
+        "subtype_test_counts",
+        "subtype_centers",
+    )
+    for key in label_level_keys:
+        if key not in metadata:
+            continue
+        values = np.asarray(metadata[key])
+        if values.ndim == 0 or values.shape[0] != num_labels:
+            actual = "scalar" if values.ndim == 0 else str(values.shape[0])
+            raise ValueError(
+                f"{key} describes {actual} labels, but dataset.num_labels={num_labels}. "
+                "The config, voxel cache, and checkpoint must use the same subtype mapping."
+            )
+
+
+def resolve_voxel_label_names(
+    metadata: Mapping[str, np.ndarray],
+    num_labels: int,
+) -> list[str]:
+    """Resolve conditioning ids to their human-readable cache labels."""
+
+    validate_voxel_conditioning_metadata(metadata, num_labels)
+    if "subtype_names" in metadata:
+        return [str(name) for name in np.asarray(metadata["subtype_names"]).reshape(-1).tolist()]
+
+    if "class_names" in metadata:
+        class_names = [str(name) for name in np.asarray(metadata["class_names"]).reshape(-1).tolist()]
+        if len(class_names) == num_labels:
+            return class_names
+
+    raise ValueError(
+        "The voxel cache does not contain a label-name table matching "
+        f"dataset.num_labels={num_labels}. Expected subtype_names for a subtype cache "
+        "or class_names for a class-conditioned cache."
+    )
 
 
 class ModelNetVoxelDataset(Dataset):
