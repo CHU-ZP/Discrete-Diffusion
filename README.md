@@ -195,7 +195,20 @@ subtype_names: readable subtype names, e.g. chair_0
 subtype_counts: empirical train-set subtype counts for prior sampling
 ```
 
-In the diffusion config, `dataset.num_classes: 2` means voxel token classes, while `dataset.num_labels: 12` means the subtype labels used for conditional generation. Voxel diffusion is trained as a pure subtype-conditioned model without a null-label branch.
+In the diffusion config, `dataset.num_classes: 2` means voxel token classes,
+while `dataset.num_labels: 12` means the subtype labels used for conditional
+generation. Voxel diffusion is trained as a pure subtype-conditioned model
+without a null-label branch.
+
+The default voxel configuration is sized for a 48 GB GPU: a 33.5M-parameter
+four-level 3D U-Net, batch size 4, and 100,000 optimization steps. It uses a
+moderate `[empty, occupied] = [1, 2]` loss weight instead of the previous
+automatic weight of up to 8, preserving thin furniture parts without strongly
+biasing uncertain boundary voxels toward occupied. The learning rate warms up
+for 2,000 steps, then follows cosine decay from `2e-4` to `2e-5`. An EMA model
+with decay `0.9999` starts after the 2,000-step warmup; before that point it
+tracks the online model exactly so random initialization does not pollute early
+quality evaluations.
 
 Start a detachable training session with `tmux`:
 
@@ -211,6 +224,21 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m ddiff.train \
   2>&1 | tee train_voxel64.log
 ```
 
+Before committing to the full run, verify the data/model path with a short run
+that skips expensive generation evaluation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python -m ddiff.train \
+  --config configs/voxel_modelnet10.yaml \
+  --steps 20 \
+  --no-eval \
+  --no-samples
+```
+
+The `--steps` override automatically shortens warmup when needed. The smoke run
+still writes into the configured v2 directories, so run it before the full job
+or remove only its small smoke-run checkpoints first.
+
 Detach without stopping training with `Ctrl-b` then `d`. Reattach later with:
 
 ```bash
@@ -222,25 +250,52 @@ Monitor training:
 ```bash
 tail -f train_voxel64.log
 watch -n 2 nvidia-smi
-ls -lh runs/voxel_modelnet10_64_subtypes/
-ls -lh outputs/voxel_modelnet10_64_subtypes/
+ls -lh runs/voxel_modelnet10_64_subtypes_v2/
+ls -lh outputs/voxel_modelnet10_64_subtypes_v2/
 ```
 
-Generate samples from the latest checkpoint:
+If the job is interrupted, resume from the latest checkpoint while keeping the
+same final `train.steps` target:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python -m ddiff.train \
+  --config configs/voxel_modelnet10.yaml \
+  --resume runs/voxel_modelnet10_64_subtypes_v2/latest.pt \
+  2>&1 | tee -a train_voxel64.log
+```
+
+Resume restores online weights, EMA weights, optimizer state, best score, and
+PyTorch random-number state. It deliberately rejects incompatible voxel,
+label, diffusion, or model settings. The DataLoader starts a newly shuffled
+epoch after resume, so resumed training is statistically equivalent but not
+bit-for-bit identical to an uninterrupted run.
+
+Every 5,000 steps, training generates two fixed-noise samples for each subtype
+using EMA weights. It compares those samples against held-out test voxels using
+nearest same-subtype IoU, occupancy error, surface-to-volume error, and removed
+fragment ratio. The lowest combined score is saved as `best.pt`; `latest.pt`
+always represents the most recent checkpoint. Both files contain raw `model`
+and averaged `ema_model` state dicts.
+
+Generate samples from the best-quality checkpoint:
 
 ```bash
 uv run python -m ddiff.sample \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --num-samples 12
 ```
+
+Sampling defaults to `--weights auto`, which loads `ema_model` when available
+and falls back to `model` for old checkpoints. To compare raw training weights,
+pass `--weights model`. `--weights ema` requires an EMA-capable checkpoint.
 
 When `--labels` is omitted for a ModelNet subtype cache, sampling first draws subtype labels from `subtype_counts`, then generates conditioned on those subtype labels. To inspect every subtype once, use:
 
 ```bash
 uv run python -m ddiff.sample \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --labels all \
   --num-samples 12
 ```
@@ -268,7 +323,7 @@ For an unfiltered diagnostic sample, override it from the command line:
 ```bash
 uv run python -m ddiff.sample \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --labels all \
   --num-samples 12 \
   --voxel-component-filter none
@@ -281,7 +336,7 @@ Generate one animation for a conditioning subtype id:
 ```bash
 uv run python scripts/sample_voxel_animation.py \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --label 7
 ```
 
@@ -303,7 +358,7 @@ for every subtype and render them in parallel:
 ```bash
 uv run python scripts/sample_voxel_animation.py \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --labels all \
   --num-samples 1 \
   --render-workers 4 \
@@ -348,7 +403,7 @@ To sample subtypes belonging to one original class, use the class name or class 
 ```bash
 uv run python -m ddiff.sample \
   --config configs/voxel_modelnet10.yaml \
-  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --classes monitor \
   --num-samples 8
 ```
@@ -359,12 +414,13 @@ Training and sampling write:
 runs/voxel_classifier_top4/best.pt
 data/modelnet10_voxel_64_top4_subtypes.npz
 data/modelnet10_voxel_64_top4_subtypes_manifest.csv
-runs/voxel_modelnet10_64_subtypes/latest.pt
-runs/voxel_modelnet10_64_subtypes/step_*.pt
-outputs/voxel_modelnet10_64_subtypes/real_voxels.png
-outputs/voxel_modelnet10_64_subtypes/generated_voxels_step_*.png
-outputs/voxel_modelnet10_64_subtypes/generated_voxels.png
-outputs/voxel_modelnet10_64_subtypes/generated_voxels.npz
+runs/voxel_modelnet10_64_subtypes_v2/best.pt
+runs/voxel_modelnet10_64_subtypes_v2/latest.pt
+runs/voxel_modelnet10_64_subtypes_v2/step_*.pt
+outputs/voxel_modelnet10_64_subtypes_v2/real_voxels.png
+outputs/voxel_modelnet10_64_subtypes_v2/generated_voxels_step_*.png
+outputs/voxel_modelnet10_64_subtypes_v2/generated_voxels.png
+outputs/voxel_modelnet10_64_subtypes_v2/generated_voxels.npz
 ```
 
 To inspect the generated voxel cache, open:
@@ -392,12 +448,27 @@ src/ddiff/visualization/voxels.py
 
 The `unet3d` backbone is a residual encoder-decoder 3D U-Net with downsampling, upsampling, bottleneck blocks, skip connections, and time/class conditioning in each residual block.
 
-Voxel training also enables token-level weighted cross entropy:
+The boundary-oriented training settings are:
 
 ```yaml
 train:
-  token_loss_weights: auto
-  max_token_loss_weight: 8.0
+  batch_size: 4
+  steps: 100000
+  lr: 0.0002
+  min_lr: 0.00002
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  token_loss_weights: [1.0, 2.0]
+  ema_start_step: 2000
+  ema_decay: 0.9999
+  sample_every: 5000
+  sample_batch_size: 24
+  sample_micro_batch_size: 4
 ```
 
-With `auto`, the training script counts voxel token frequencies in the train split and up-weights rare tokens. For binary occupancy this gives occupied voxels a larger loss weight than empty voxels, which helps counter the strong empty/occupied imbalance without changing the diffusion transition process.
+If batch size 4 does not fit because other processes occupy GPU memory, lower
+only `train.batch_size` to 2. `sample_micro_batch_size` controls evaluation-time
+GPU memory independently and can also be reduced without changing the quality
+metric or number of evaluated samples. Changing the model architecture, voxel
+cache, label count, or diffusion schedule makes checkpoints incompatible; the
+v2 output directory intentionally avoids overwriting the original experiment.

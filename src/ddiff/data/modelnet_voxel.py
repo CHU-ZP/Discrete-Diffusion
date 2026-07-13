@@ -120,7 +120,9 @@ class ModelNetVoxelDataset(Dataset):
                 f"{self.cache_path} must contain either x or {split}_x arrays."
             )
 
-        self.x = torch.from_numpy(x.astype(np.int64)).long()
+        # Keep the cache compact in host memory. Training converts each batch
+        # to long only after moving it to the target device.
+        self.x = torch.from_numpy(x.astype(np.uint8))
         self.y = torch.from_numpy(y.astype(np.int64)).long() if y is not None else None
 
         if self.x.ndim != 4:

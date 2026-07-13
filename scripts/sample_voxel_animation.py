@@ -20,6 +20,7 @@ from ddiff.diffusion.categorical import CategoricalDiffusion
 from ddiff.models.registry import build_model
 from ddiff.postprocessing.voxels import filter_voxel_components
 from ddiff.sample import _resolve_sampling_label_names, _validate_checkpoint_sampling_config
+from ddiff.utils.checkpoints import load_sampling_weights
 from ddiff.utils.config import ensure_dir, load_config, resolve_device
 from ddiff.utils.seed import set_seed
 
@@ -51,7 +52,7 @@ def main() -> None:
     parser.add_argument("--config", default="configs/voxel_modelnet10.yaml")
     parser.add_argument(
         "--ckpt",
-        default="runs/voxel_modelnet10_64_subtypes/latest.pt",
+        default="runs/voxel_modelnet10_64_subtypes_v2/best.pt",
         help="Voxel diffusion checkpoint.",
     )
     label_group = parser.add_mutually_exclusive_group(required=True)
@@ -104,6 +105,12 @@ def main() -> None:
     parser.add_argument("--elev", type=float, default=30.0)
     parser.add_argument("--azim", type=float, default=-60.0)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--weights",
+        choices=("auto", "ema", "model"),
+        default="auto",
+        help="Checkpoint weights: auto prefers EMA and supports legacy raw-only checkpoints.",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--voxel-component-filter",
@@ -147,7 +154,8 @@ def main() -> None:
     checkpoint = torch.load(args.ckpt, map_location=device)
     _validate_checkpoint_sampling_config(cfg, checkpoint)
     model = build_model(cfg).to(device)
-    model.load_state_dict(checkpoint["model"])
+    loaded_weights = load_sampling_weights(model, checkpoint, args.weights)
+    print(f"Loaded checkpoint weights: {loaded_weights}.")
     model.eval()
     diffusion = CategoricalDiffusion.from_config(cfg, device=device)
 

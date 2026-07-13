@@ -20,10 +20,12 @@ diffusion:
 
 model:
   name: unet3d
-  base_channels: 32
-  channel_mults: [1, 2, 4]
+  # Sized for a 48 GB training GPU. The 8^3 bottleneck gives the denoiser a
+  # stronger whole-shape representation than the previous three-level model.
+  base_channels: 48
+  channel_mults: [1, 2, 4, 4]
   num_res_blocks: 2
-  dropout: 0.1
+  dropout: 0.05
 
 sample:
   # Remove disconnected floating fragments after generation by keeping the
@@ -32,20 +34,46 @@ sample:
   voxel_connectivity: 6
 
 train:
-  batch_size: 2
-  steps: 50000
+  batch_size: 4
+  steps: 100000
   lr: 0.0002
+  min_lr: 0.00002
+  lr_scheduler: cosine
+  warmup_steps: 2000
+  warmup_start_factor: 0.05
   weight_decay: 0.01
-  # Automatically up-weight rare voxel tokens. For binary occupancy this raises
-  # the occupied class loss relative to the dominant empty class.
-  token_loss_weights: auto
-  max_token_loss_weight: 8.0
+  # A moderate occupied-token weight preserves thin parts without the severe
+  # boundary over-occupancy caused by the previous automatic weight (up to 8x).
+  token_loss_weights: [1.0, 2.0]
+  # Track the online weights exactly through warmup, then start EMA so the
+  # random initialization does not dominate early quality evaluations.
+  ema_start_step: 2000
+  ema_decay: 0.9999
   log_every: 100
-  sample_every: 1000
-  sample_batch_size: 12
-  num_workers: 2
+  sample_every: 5000
+  # Two deterministic quality samples per subtype, sampled in memory-safe
+  # micro-batches and then rendered together.
+  sample_batch_size: 24
+  sample_micro_batch_size: 4
+  num_workers: 4
   device: auto
 
+evaluation:
+  enabled: true
+  every: 5000
+  seed: 12345
+  reference_samples_per_label: 16
+  # Lower is better. The score compares generated shapes with held-out real
+  # voxels and also penalizes incorrect occupancy, rough boundaries, and
+  # disconnected fragments.
+  weights:
+    nearest_iou: 1.0
+    occupancy: 0.25
+    surface: 0.5
+    fragments: 0.5
+
 output:
-  run_dir: runs/voxel_modelnet10_64_subtypes
-  sample_dir: outputs/voxel_modelnet10_64_subtypes
+  # Use a new directory because the larger architecture is intentionally not
+  # compatible with checkpoints from the original experiment.
+  run_dir: runs/voxel_modelnet10_64_subtypes_v2
+  sample_dir: outputs/voxel_modelnet10_64_subtypes_v2

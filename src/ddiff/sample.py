@@ -14,6 +14,7 @@ from ddiff.data.modelnet_voxel import (
 from ddiff.diffusion.categorical import CategoricalDiffusion
 from ddiff.models.registry import build_model
 from ddiff.postprocessing.voxels import ComponentFilterStats, filter_voxel_components
+from ddiff.utils.checkpoints import load_sampling_weights
 from ddiff.utils.config import ensure_dir, load_config, resolve_device
 from ddiff.utils.seed import set_seed
 from ddiff.visualization.images import save_image_grid, save_reverse_chain
@@ -39,6 +40,12 @@ def main() -> None:
         help="Optional comma-separated ModelNet original class ids or names; samples subtypes within those classes.",
     )
     parser.add_argument("--device", default=None, help="Optional device override.")
+    parser.add_argument(
+        "--weights",
+        choices=("auto", "ema", "model"),
+        default="auto",
+        help="Checkpoint weights: auto prefers EMA and supports legacy raw-only checkpoints.",
+    )
     parser.add_argument(
         "--voxel-component-filter",
         choices=("largest", "none"),
@@ -70,7 +77,8 @@ def main() -> None:
     model = build_model(cfg).to(device)
     checkpoint = torch.load(args.ckpt, map_location=device)
     _validate_checkpoint_sampling_config(cfg, checkpoint)
-    model.load_state_dict(checkpoint["model"])
+    loaded_weights = load_sampling_weights(model, checkpoint, args.weights)
+    print(f"Loaded checkpoint weights: {loaded_weights}.")
     model.eval()
     diffusion = CategoricalDiffusion.from_config(cfg, device=device)
 
@@ -250,6 +258,11 @@ def _validate_checkpoint_sampling_config(cfg: dict, checkpoint: dict) -> None:
         ("diffusion", "beta_end"),
         ("diffusion", "transition"),
         ("model", "name"),
+        ("model", "base_channels"),
+        ("model", "channel_mults"),
+        ("model", "num_res_blocks"),
+        ("model", "num_blocks"),
+        ("model", "dropout"),
     )
     mismatches: list[str] = []
     for section, key in checks:
