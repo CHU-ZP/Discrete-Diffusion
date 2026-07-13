@@ -131,6 +131,7 @@ class CategoricalDiffusion:
         batch_size: int | None = None,
         return_chain: bool = False,
         chain_steps: Iterable[int] | None = None,
+        chain_dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[int, torch.Tensor]]:
         """Sample from p_theta by iterating the learned reverse chain."""
@@ -166,14 +167,16 @@ class CategoricalDiffusion:
         chain_step_set = {int(step) for step in chain_steps}
         chain: dict[int, torch.Tensor] = {}
         if return_chain and self.timesteps in chain_step_set:
-            chain[self.timesteps] = x_t.detach().cpu()
+            snapshot = x_t.detach().cpu()
+            chain[self.timesteps] = snapshot if chain_dtype is None else snapshot.to(chain_dtype)
 
         for t_int in range(self.timesteps, 0, -1):
             t = torch.full((sample_shape[0],), t_int, device=device, dtype=torch.long)
             logits = model(x_t, t, y)
             x_t = self._sample_previous_from_logits(x_t, logits, t_int)
             if return_chain and (t_int - 1) in chain_step_set:
-                chain[t_int - 1] = x_t.detach().cpu()
+                snapshot = x_t.detach().cpu()
+                chain[t_int - 1] = snapshot if chain_dtype is None else snapshot.to(chain_dtype)
 
         if model_was_training:
             model.train()

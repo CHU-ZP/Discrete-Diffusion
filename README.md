@@ -297,6 +297,52 @@ for speed while the final frames render at 64³; these can be changed with
 `--render-resolution` and `--final-render-resolution` without changing the
 model's actual 64³ sampling resolution.
 
+GIF frames contain no title or text overlay. To generate one independent GIF
+for every subtype and render them in parallel:
+
+```bash
+uv run python scripts/sample_voxel_animation.py \
+  --config configs/voxel_modelnet10.yaml \
+  --ckpt runs/voxel_modelnet10_64_subtypes/latest.pt \
+  --labels all \
+  --num-samples 1 \
+  --render-workers 4 \
+  --frame-stride 2
+```
+
+You can also select several different subtypes by readable name or numeric id:
+
+```bash
+uv run python scripts/sample_voxel_animation.py \
+  --labels chair_0,sofa_1,bed_2 \
+  --num-samples 2 \
+  --render-workers 4
+```
+
+Here, `--num-samples` means samples **per selected subtype**, so the second
+command generates six GIFs. Each sample is conditioned on its own subtype id;
+the names are not merely output filename labels. `--label bed_1` remains the
+short form for selecting one subtype.
+
+To generate several independent samples for the same subtype:
+
+```bash
+uv run python scripts/sample_voxel_animation.py \
+  --label bed_1 \
+  --num-samples 4 \
+  --render-workers 4 \
+  --frame-stride 2
+```
+
+This writes `reverse_diffusion_bed_1_sample_000.gif` through
+`reverse_diffusion_bed_1_sample_003.gif`. Sampling is batched on the selected
+device, while GIF rendering runs in separate CPU processes. With
+`--render-workers 0` the script automatically uses up to four workers. For
+multiple samples or subtypes, a `.gif` passed to `--output` is treated as a
+filename prefix; passing a path without the `.gif` suffix treats it as an
+output directory. Output filenames always contain the readable subtype name
+when multiple subtypes are selected.
+
 To sample subtypes belonging to one original class, use the class name or class id:
 
 ```bash

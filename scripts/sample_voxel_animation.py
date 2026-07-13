@@ -4,16 +4,15 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
-import textwrap
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from multiprocessing import get_context
 from pathlib import Path
-
-import matplotlib
-
-matplotlib.use("Agg")
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
 from ddiff.data.modelnet_voxel import load_voxel_cache_metadata
@@ -23,6 +22,23 @@ from ddiff.postprocessing.voxels import filter_voxel_components
 from ddiff.sample import _resolve_sampling_label_names, _validate_checkpoint_sampling_config
 from ddiff.utils.config import ensure_dir, load_config, resolve_device
 from ddiff.utils.seed import set_seed
+
+
+@dataclass
+class AnimationRenderTask:
+    sample_index: int
+    diffusion_frames: np.ndarray
+    diffusion_steps: tuple[int, ...]
+    filtered_result: np.ndarray
+    removed_voxels: np.ndarray
+    output: Path
+    frame_duration_ms: int
+    hold_duration_ms: int
+    render_resolution: int
+    final_render_resolution: int
+    image_size: int
+    elev: float
+    azim: float
 
 
 def main() -> None:
@@ -38,12 +54,32 @@ def main() -> None:
         default="runs/voxel_modelnet10_64_subtypes/latest.pt",
         help="Voxel diffusion checkpoint.",
     )
-    parser.add_argument(
+    label_group = parser.add_mutually_exclusive_group(required=True)
+    label_group.add_argument(
         "--label",
-        required=True,
         help="Conditioning subtype id or exact subtype name, for example 7 or bed_1.",
     )
-    parser.add_argument("--output", default=None, help="Output GIF path.")
+    label_group.add_argument(
+        "--labels",
+        help="Comma-separated subtype ids/names, or 'all' to animate every subtype.",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=1,
+        help="Number of independently generated GIFs per selected subtype.",
+    )
+    parser.add_argument(
+        "--render-workers",
+        type=int,
+        default=0,
+        help="Parallel rendering processes; 0 chooses automatically.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Output GIF path for one sample, filename prefix for multiple samples, or output directory.",
+    )
     parser.add_argument("--frame-stride", type=int, default=1, help="Keep every Nth diffusion step.")
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument(
@@ -77,6 +113,10 @@ def main() -> None:
     parser.add_argument("--voxel-connectivity", type=int, choices=(6, 26), default=None)
     args = parser.parse_args()
 
+    if args.num_samples <= 0:
+        raise ValueError("--num-samples must be positive.")
+    if args.render_workers < 0:
+        raise ValueError("--render-workers must be non-negative.")
     if args.frame_stride <= 0:
         raise ValueError("--frame-stride must be positive.")
     if args.fps <= 0:
@@ -114,109 +154,94 @@ def main() -> None:
     num_labels = int(cfg["dataset"]["num_labels"])
     metadata = load_voxel_cache_metadata(cfg["dataset"]["cache_path"])
     label_names = _resolve_sampling_label_names(checkpoint, metadata, num_labels)
-    label_id = _resolve_label(args.label, label_names)
-    label_name = label_names[label_id]
+    selected_label_ids = _resolve_labels(
+        args.labels if args.labels is not None else args.label,
+        label_names,
+    )
+    selected_label_names = [label_names[label] for label in selected_label_ids]
+    sample_label_ids = [
+        label
+        for label in selected_label_ids
+        for _ in range(args.num_samples)
+    ]
+    total_samples = len(sample_label_ids)
 
     chain_steps = list(range(diffusion.timesteps, -1, -args.frame_stride))
     if chain_steps[-1] != 0:
         chain_steps.append(0)
 
     print(
-        f"Sampling subtype {label_id} -> {label_name!r} on {device}; "
-        f"recording {len(chain_steps)} diffusion frames."
+        f"Sampling {len(selected_label_ids)} subtypes on {device}: "
+        f"{list(zip(selected_label_ids, selected_label_names))}; generating {args.num_samples} "
+        f"sample(s) per subtype ({total_samples} total) with {len(chain_steps)} recorded frames."
     )
     _, chain = diffusion.sample(
         model,
         tuple(cfg["dataset"]["shape"]),
-        y=torch.tensor([label_id], device=device, dtype=torch.long),
-        batch_size=1,
+        y=torch.tensor(sample_label_ids, device=device, dtype=torch.long),
+        batch_size=total_samples,
         return_chain=True,
         chain_steps=chain_steps,
+        chain_dtype=torch.uint8,
         device=device,
     )
 
-    raw_result = chain[0][0].long()
+    raw_results = chain[0]
     sample_cfg = cfg.get("sample", {})
     filter_mode = str(sample_cfg.get("voxel_component_filter", "largest"))
     connectivity = int(sample_cfg.get("voxel_connectivity", 6))
     filtered_batch, stats = filter_voxel_components(
-        raw_result.unsqueeze(0),
+        raw_results,
         mode=filter_mode,
         connectivity=connectivity,
     )
-    filtered_result = filtered_batch[0]
-    removed = raw_result.bool() & ~filtered_result.bool()
-    stat = stats[0]
+    removed_batch = raw_results.bool() & ~filtered_batch.bool()
 
-    output = _output_path(args.output, cfg, label_name)
+    outputs = _output_paths(
+        args.output,
+        cfg,
+        selected_label_names,
+        args.num_samples,
+    )
     frame_duration_ms = max(1, round(1000.0 / args.fps))
     hold_duration_ms = max(frame_duration_ms, round(args.hold_seconds * 1000.0))
-    frames: list[Image.Image] = []
-    durations: list[int] = []
-
-    ordered_steps = sorted(chain, reverse=True)
-    for step in tqdm(ordered_steps, desc="render diffusion", dynamic_ncols=True):
-        stage = "initial noise" if step == diffusion.timesteps else "reverse diffusion"
-        if step == 0:
-            stage = "raw generated result"
-        frames.append(
-            _render_frame(
-                chain[step][0],
-                title=f"{label_name} | {stage} | t={step}",
-                render_resolution=(
-                    args.final_render_resolution if step == 0 else args.render_resolution
-                ),
-                image_size=args.image_size,
-                elev=args.elev,
-                azim=args.azim,
-            )
-        )
-        durations.append(hold_duration_ms if step == 0 else frame_duration_ms)
-
-    detection_title = (
-        f"{label_name} | connected components={stat.components} | "
-        f"red voxels to remove={stat.removed_voxels}"
-    )
-    frames.append(
-        _render_frame(
-            filtered_result,
-            removed=removed,
-            title=detection_title,
-            render_resolution=args.final_render_resolution,
-            image_size=args.image_size,
-            elev=args.elev,
-            azim=args.azim,
-        )
-    )
-    durations.append(hold_duration_ms)
-    frames.append(
-        _render_frame(
-            filtered_result,
-            title=(
-                f"{label_name} | filtered result | kept={stat.kept_voxels}, "
-                f"removed={stat.removed_voxels}"
+    ordered_steps = tuple(sorted(chain, reverse=True))
+    tasks = [
+        AnimationRenderTask(
+            sample_index=index,
+            diffusion_frames=np.stack(
+                [chain[step][index].numpy() for step in ordered_steps], axis=0
             ),
-            render_resolution=args.final_render_resolution,
+            diffusion_steps=ordered_steps,
+            filtered_result=filtered_batch[index].numpy(),
+            removed_voxels=removed_batch[index].numpy(),
+            output=outputs[index],
+            frame_duration_ms=frame_duration_ms,
+            hold_duration_ms=hold_duration_ms,
+            render_resolution=args.render_resolution,
+            final_render_resolution=args.final_render_resolution,
             image_size=args.image_size,
             elev=args.elev,
             azim=args.azim,
         )
-    )
-    durations.append(hold_duration_ms)
+        for index in range(total_samples)
+    ]
+    del chain
 
-    frames[0].save(
-        output,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=durations,
-        loop=0,
-        disposal=2,
-    )
-    print(f"Saved animation: {output.resolve()}")
+    worker_count = args.render_workers or min(total_samples, os.cpu_count() or 1, 4)
+    worker_count = min(worker_count, total_samples)
+    rendered_outputs = _render_tasks(tasks, worker_count)
+    for sample_index, output in rendered_outputs:
+        stat = stats[sample_index]
+        label_id = sample_label_ids[sample_index]
+        print(
+            f"Saved sample {sample_index:03d} ({label_id} -> {label_names[label_id]}): "
+            f"{output.resolve()} "
+            f"(components={stat.components}, removed_voxels={stat.removed_voxels})"
+        )
     print(
-        f"Component filter: mode={filter_mode}, connectivity={connectivity}, "
-        f"components={stat.components}, removed_voxels={stat.removed_voxels}."
+        f"Component filter: mode={filter_mode}, connectivity={connectivity}; "
+        f"render workers={worker_count}."
     )
 
 
@@ -234,33 +259,153 @@ def _resolve_label(value: str, label_names: list[str]) -> int:
     return normalized.index(value.casefold())
 
 
-def _output_path(output_arg: str | None, cfg: dict, label_name: str) -> Path:
-    if output_arg is not None:
-        output = Path(output_arg)
+def _resolve_labels(value: str, label_names: list[str]) -> list[int]:
+    if value is None:
+        raise ValueError("A label selection is required.")
+    if value.strip().casefold() == "all":
+        return list(range(len(label_names)))
+
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if not items:
+        raise ValueError("The label selection is empty.")
+    labels = [_resolve_label(item, label_names) for item in items]
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"Duplicate subtype labels are not allowed: {items}.")
+    return labels
+
+
+def _output_paths(
+    output_arg: str | None,
+    cfg: dict,
+    label_names: list[str],
+    samples_per_label: int,
+) -> list[Path]:
+    if output_arg is None:
+        parent = Path(cfg["output"]["sample_dir"])
+        custom_stem = None
     else:
-        safe_name = "".join(char if char.isalnum() or char in "-_" else "_" for char in label_name)
-        output = Path(cfg["output"]["sample_dir"]) / f"reverse_diffusion_{safe_name}.gif"
-    ensure_dir(output.parent)
-    return output
+        requested = Path(output_arg)
+        if requested.suffix.lower() == ".gif":
+            parent = requested.parent
+            custom_stem = requested.stem
+        else:
+            parent = requested
+            custom_stem = None
+    ensure_dir(parent)
+
+    outputs: list[Path] = []
+    multiple_labels = len(label_names) > 1
+    digits = max(3, len(str(samples_per_label - 1)))
+    for label_name in label_names:
+        safe_name = "".join(
+            char if char.isalnum() or char in "-_" else "_" for char in label_name
+        )
+        if custom_stem is None:
+            stem = f"reverse_diffusion_{safe_name}"
+        elif multiple_labels:
+            stem = f"{custom_stem}_{safe_name}"
+        else:
+            stem = custom_stem
+        for sample_index in range(samples_per_label):
+            suffix = f"_sample_{sample_index:0{digits}d}" if samples_per_label > 1 else ""
+            outputs.append(parent / f"{stem}{suffix}.gif")
+    return outputs
+
+
+def _render_tasks(
+    tasks: list[AnimationRenderTask],
+    worker_count: int,
+) -> list[tuple[int, Path]]:
+    if worker_count <= 0:
+        raise ValueError("worker_count must be positive.")
+    if worker_count == 1:
+        return [_render_animation(task) for task in tqdm(tasks, desc="render animations")]
+
+    results: list[tuple[int, Path]] = []
+    context = get_context("spawn")
+    with ProcessPoolExecutor(max_workers=worker_count, mp_context=context) as executor:
+        futures = {executor.submit(_render_animation, task): task.sample_index for task in tasks}
+        progress = tqdm(total=len(futures), desc="render animations", dynamic_ncols=True)
+        for future in as_completed(futures):
+            results.append(future.result())
+            progress.update(1)
+        progress.close()
+    return sorted(results)
+
+
+def _render_animation(task: AnimationRenderTask) -> tuple[int, Path]:
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+    for frame, step in zip(task.diffusion_frames, task.diffusion_steps):
+        frames.append(
+            _render_frame(
+                frame,
+                render_resolution=(
+                    task.final_render_resolution if step == 0 else task.render_resolution
+                ),
+                image_size=task.image_size,
+                elev=task.elev,
+                azim=task.azim,
+            )
+        )
+        durations.append(task.hold_duration_ms if step == 0 else task.frame_duration_ms)
+
+    frames.append(
+        _render_frame(
+            task.filtered_result,
+            removed=task.removed_voxels,
+            render_resolution=task.final_render_resolution,
+            image_size=task.image_size,
+            elev=task.elev,
+            azim=task.azim,
+        )
+    )
+    durations.append(task.hold_duration_ms)
+    frames.append(
+        _render_frame(
+            task.filtered_result,
+            render_resolution=task.final_render_resolution,
+            image_size=task.image_size,
+            elev=task.elev,
+            azim=task.azim,
+        )
+    )
+    durations.append(task.hold_duration_ms)
+
+    frames[0].save(
+        task.output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=durations,
+        loop=0,
+        disposal=2,
+    )
+    return task.sample_index, task.output
 
 
 def _render_frame(
-    voxels: torch.Tensor,
+    voxels: torch.Tensor | np.ndarray,
     *,
-    title: str,
     render_resolution: int,
     image_size: int,
     elev: float,
     azim: float,
     removed: torch.Tensor | None = None,
 ) -> Image.Image:
-    occupied = voxels.detach().cpu().numpy().astype(bool)
+    if isinstance(voxels, torch.Tensor):
+        occupied = voxels.detach().cpu().numpy().astype(bool)
+    else:
+        occupied = np.asarray(voxels).astype(bool)
     if occupied.ndim != 3:
         raise ValueError(f"Expected one [D, H, W] voxel sample, got {occupied.shape}.")
 
     values = occupied.astype(np.uint8)
     if removed is not None:
-        removed_mask = removed.detach().cpu().numpy().astype(bool)
+        if isinstance(removed, torch.Tensor):
+            removed_mask = removed.detach().cpu().numpy().astype(bool)
+        else:
+            removed_mask = np.asarray(removed).astype(bool)
         if removed_mask.shape != occupied.shape:
             raise ValueError("removed mask must have the same shape as voxels.")
         values[removed_mask] = 2
@@ -268,7 +413,6 @@ def _render_frame(
     values = _downsample_volume(values, render_resolution)
     return _render_voxel_cubes(
         values,
-        title=title,
         image_size=image_size,
         elev=elev,
         azim=azim,
@@ -290,7 +434,6 @@ def _downsample_volume(values: np.ndarray, max_resolution: int) -> np.ndarray:
 def _render_voxel_cubes(
     values: np.ndarray,
     *,
-    title: str,
     image_size: int,
     elev: float,
     azim: float,
@@ -301,7 +444,6 @@ def _render_voxel_cubes(
     image = Image.new("RGB", (image_size, image_size), "white")
     draw = ImageDraw.Draw(image)
     if not np.any(occupied):
-        _draw_title(draw, title, image_size)
         return image
 
     right, up, view = _camera_basis(elev=elev, azim=azim)
@@ -328,7 +470,6 @@ def _render_voxel_cubes(
         shades.append(0.58 + 0.42 * max(0.0, float(normal @ light)))
 
     if not polygons:
-        _draw_title(draw, title, image_size)
         return image
 
     polygon_array = np.concatenate(polygons, axis=0)
@@ -350,7 +491,6 @@ def _render_voxel_cubes(
         points = [tuple(point) for point in pixel_polygons[index].round().astype(np.int32)]
         draw.polygon(points, fill=fill, outline=edge, width=1)
 
-    _draw_title(draw, title, image_size)
     return image
 
 
@@ -409,34 +549,15 @@ def _project_to_pixels(
     maximum = projected_corners.max(axis=0)
     center = (minimum + maximum) * 0.5
     span = np.maximum(maximum - minimum, 1e-6)
-    title_height = 64
     margin = 28
     available_width = image_size - 2 * margin
-    available_height = image_size - title_height - 2 * margin
+    available_height = image_size - 2 * margin
     scale = min(available_width / span[0], available_height / span[1])
 
     pixels = polygons.copy()
     pixels[..., 0] = (pixels[..., 0] - center[0]) * scale + image_size * 0.5
-    pixels[..., 1] = (
-        title_height + available_height * 0.5 - (pixels[..., 1] - center[1]) * scale
-    )
+    pixels[..., 1] = image_size * 0.5 - (pixels[..., 1] - center[1]) * scale
     return pixels
-
-
-def _draw_title(draw: ImageDraw.ImageDraw, title: str, image_size: int) -> None:
-    font_path = Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf"
-    font = ImageFont.truetype(str(font_path), size=max(12, image_size // 38))
-    wrapped = textwrap.fill(title, width=max(36, image_size // 9))
-    bounds = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=2)
-    width = bounds[2] - bounds[0]
-    draw.multiline_text(
-        ((image_size - width) * 0.5, 8),
-        wrapped,
-        fill=(20, 20, 20),
-        font=font,
-        align="center",
-        spacing=2,
-    )
 
 
 if __name__ == "__main__":
