@@ -341,16 +341,20 @@ uv run python scripts/sample_voxel_animation.py \
 ```
 
 `--label` also accepts the exact subtype name, such as `--label bed_1`. The GIF
-shows the initial noise, every recorded reverse-diffusion step, the raw result,
-the connected-component detection frame with removable fragments in red, and
-the filtered result. By default every diffusion step is recorded; use
-`--frame-stride 5` for a smaller and faster GIF or `--output path/to/file.gif`
-to select the destination. Frames use opaque voxel cube faces rather than a
-point cloud, preserve the tensor axis order used by `save_voxel_grid`, and use
-the same default view (`elev=30`, `azim=-60`). Diffusion frames render at 32³
-for speed while the final frames render at 64³; these can be changed with
-`--render-resolution` and `--final-render-resolution` without changing the
-model's actual 64³ sampling resolution.
+flows directly from the initial noise through reverse diffusion to the cleaned
+result. Connected-component filtering is still applied, but the raw/detection/
+filtered comparison is no longer shown: the final diffusion frame is silently
+replaced by the cleaned result. Animation timing is fixed internally at 20 FPS
+with every second diffusion step recorded, giving exactly 2.5 seconds of
+denoising followed by a one-second final hold for the configured 100-step
+model. There are no timing controls to pass on the command line. Use
+`--output path/to/file.gif` to select the destination. Frames use opaque voxel
+cube faces rather than a point cloud, preserve the tensor axis order used by
+`save_voxel_grid`, and use the same default view (`elev=30`, `azim=-60`).
+Diffusion frames render at 32³ for speed while the final frame renders at 64³;
+these can be changed with `--render-resolution` and
+`--final-render-resolution` without changing the model's actual 64³ sampling
+resolution.
 
 GIF frames contain no title or text overlay. To generate one independent GIF
 for every subtype and render them in parallel:
@@ -361,8 +365,7 @@ uv run python scripts/sample_voxel_animation.py \
   --ckpt runs/voxel_modelnet10_64_subtypes_v2/best.pt \
   --labels all \
   --num-samples 1 \
-  --render-workers 4 \
-  --frame-stride 2
+  --render-workers 4
 ```
 
 You can also select several different subtypes by readable name or numeric id:
@@ -385,8 +388,7 @@ To generate several independent samples for the same subtype:
 uv run python scripts/sample_voxel_animation.py \
   --label bed_1 \
   --num-samples 4 \
-  --render-workers 4 \
-  --frame-stride 2
+  --render-workers 4
 ```
 
 This writes `reverse_diffusion_bed_1_sample_000.gif` through

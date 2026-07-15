@@ -60,19 +60,10 @@ class VoxelAnimationTests(unittest.TestCase):
         raw[7, 7, 7] = 1
         filtered = raw.clone()
         filtered[7, 7, 7] = 0
-        removed = raw.bool() & ~filtered.bool()
 
         frames = [
             _render_frame(
                 raw,
-                render_resolution=8,
-                image_size=320,
-                elev=30,
-                azim=-60,
-            ),
-            _render_frame(
-                filtered,
-                removed=removed,
                 render_resolution=8,
                 image_size=320,
                 elev=30,
@@ -94,12 +85,12 @@ class VoxelAnimationTests(unittest.TestCase):
                 format="GIF",
                 save_all=True,
                 append_images=frames[1:],
-                duration=[100, 200, 300],
+                duration=[100, 200],
                 loop=0,
                 disposal=2,
             )
             with Image.open(output) as image:
-                self.assertEqual(image.n_frames, 3)
+                self.assertEqual(image.n_frames, 2)
 
     def test_multiple_output_names_are_unique(self) -> None:
         cfg = {"output": {"sample_dir": "outputs/test"}}
@@ -133,7 +124,7 @@ class VoxelAnimationTests(unittest.TestCase):
         raw[1, 1:4, 1:4, 1:4] = 1
         raw[2, 1:5, 1:5, 1:5] = 1
         filtered = raw[-1].copy()
-        removed = np.zeros_like(filtered)
+        filtered[4, 4, 4] = 0
 
         with tempfile.TemporaryDirectory() as temp_dir:
             tasks = [
@@ -142,10 +133,7 @@ class VoxelAnimationTests(unittest.TestCase):
                     diffusion_frames=raw,
                     diffusion_steps=(2, 1, 0),
                     filtered_result=filtered,
-                    removed_voxels=removed,
                     output=Path(temp_dir) / f"sample_{index}.gif",
-                    frame_duration_ms=50,
-                    hold_duration_ms=100,
                     render_resolution=8,
                     final_render_resolution=8,
                     image_size=240,
@@ -157,6 +145,14 @@ class VoxelAnimationTests(unittest.TestCase):
             results = _render_tasks(tasks, worker_count=2)
             self.assertEqual([index for index, _ in results], [0, 1])
             self.assertTrue(all(path.exists() for _, path in results))
+            for _, path in results:
+                with Image.open(path) as image:
+                    self.assertEqual(image.n_frames, 3)
+                    durations = []
+                    for frame_index in range(image.n_frames):
+                        image.seek(frame_index)
+                        durations.append(image.info["duration"])
+                    self.assertEqual(durations, [50, 50, 1000])
 
     def test_diffusion_chain_can_be_recorded_as_uint8(self) -> None:
         class ZeroModel(torch.nn.Module):

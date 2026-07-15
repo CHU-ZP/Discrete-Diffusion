@@ -25,16 +25,20 @@ from ddiff.utils.config import ensure_dir, load_config, resolve_device
 from ddiff.utils.seed import set_seed
 
 
+ANIMATION_FPS = 20.0
+ANIMATION_FRAME_STRIDE = 2
+FINAL_HOLD_SECONDS = 1.0
+FRAME_DURATION_MS = round(1000.0 / ANIMATION_FPS)
+FINAL_HOLD_DURATION_MS = round(FINAL_HOLD_SECONDS * 1000.0)
+
+
 @dataclass
 class AnimationRenderTask:
     sample_index: int
     diffusion_frames: np.ndarray
     diffusion_steps: tuple[int, ...]
     filtered_result: np.ndarray
-    removed_voxels: np.ndarray
     output: Path
-    frame_duration_ms: int
-    hold_duration_ms: int
     render_resolution: int
     final_render_resolution: int
     image_size: int
@@ -44,10 +48,7 @@ class AnimationRenderTask:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Generate a voxel GIF showing reverse diffusion, the raw result, "
-            "connected-component detection, and the filtered result."
-        )
+        description="Generate a smooth voxel GIF from initial noise to the cleaned final result."
     )
     parser.add_argument("--config", default="configs/voxel_modelnet10.yaml")
     parser.add_argument(
@@ -81,14 +82,6 @@ def main() -> None:
         default=None,
         help="Output GIF path for one sample, filename prefix for multiple samples, or output directory.",
     )
-    parser.add_argument("--frame-stride", type=int, default=1, help="Keep every Nth diffusion step.")
-    parser.add_argument("--fps", type=float, default=10.0)
-    parser.add_argument(
-        "--hold-seconds",
-        type=float,
-        default=1.5,
-        help="How long to hold the raw, detection, and filtered final frames.",
-    )
     parser.add_argument(
         "--render-resolution",
         type=int,
@@ -99,7 +92,7 @@ def main() -> None:
         "--final-render-resolution",
         type=int,
         default=64,
-        help="Voxel render resolution for raw/detection/filtered final frames.",
+        help="Voxel render resolution for the cleaned final frame.",
     )
     parser.add_argument("--image-size", type=int, default=640, help="Square GIF frame size in pixels.")
     parser.add_argument("--elev", type=float, default=30.0)
@@ -124,12 +117,6 @@ def main() -> None:
         raise ValueError("--num-samples must be positive.")
     if args.render_workers < 0:
         raise ValueError("--render-workers must be non-negative.")
-    if args.frame_stride <= 0:
-        raise ValueError("--frame-stride must be positive.")
-    if args.fps <= 0:
-        raise ValueError("--fps must be positive.")
-    if args.hold_seconds < 0:
-        raise ValueError("--hold-seconds must be non-negative.")
     if args.render_resolution <= 0 or args.final_render_resolution <= 0:
         raise ValueError("Render resolutions must be positive.")
     if args.image_size < 200:
@@ -174,7 +161,7 @@ def main() -> None:
     ]
     total_samples = len(sample_label_ids)
 
-    chain_steps = list(range(diffusion.timesteps, -1, -args.frame_stride))
+    chain_steps = list(range(diffusion.timesteps, -1, -ANIMATION_FRAME_STRIDE))
     if chain_steps[-1] != 0:
         chain_steps.append(0)
 
@@ -203,7 +190,6 @@ def main() -> None:
         mode=filter_mode,
         connectivity=connectivity,
     )
-    removed_batch = raw_results.bool() & ~filtered_batch.bool()
 
     outputs = _output_paths(
         args.output,
@@ -211,8 +197,6 @@ def main() -> None:
         selected_label_names,
         args.num_samples,
     )
-    frame_duration_ms = max(1, round(1000.0 / args.fps))
-    hold_duration_ms = max(frame_duration_ms, round(args.hold_seconds * 1000.0))
     ordered_steps = tuple(sorted(chain, reverse=True))
     tasks = [
         AnimationRenderTask(
@@ -222,10 +206,7 @@ def main() -> None:
             ),
             diffusion_steps=ordered_steps,
             filtered_result=filtered_batch[index].numpy(),
-            removed_voxels=removed_batch[index].numpy(),
             output=outputs[index],
-            frame_duration_ms=frame_duration_ms,
-            hold_duration_ms=hold_duration_ms,
             render_resolution=args.render_resolution,
             final_render_resolution=args.final_render_resolution,
             image_size=args.image_size,
@@ -345,9 +326,13 @@ def _render_animation(task: AnimationRenderTask) -> tuple[int, Path]:
     frames: list[Image.Image] = []
     durations: list[int] = []
     for frame, step in zip(task.diffusion_frames, task.diffusion_steps):
+        # Replace the raw t=0 state with its silently cleaned version. This
+        # keeps component filtering out of the visible animation while still
+        # ensuring the final object has no detached fragments.
+        displayed_frame = task.filtered_result if step == 0 else frame
         frames.append(
             _render_frame(
-                frame,
+                displayed_frame,
                 render_resolution=(
                     task.final_render_resolution if step == 0 else task.render_resolution
                 ),
@@ -356,29 +341,7 @@ def _render_animation(task: AnimationRenderTask) -> tuple[int, Path]:
                 azim=task.azim,
             )
         )
-        durations.append(task.hold_duration_ms if step == 0 else task.frame_duration_ms)
-
-    frames.append(
-        _render_frame(
-            task.filtered_result,
-            removed=task.removed_voxels,
-            render_resolution=task.final_render_resolution,
-            image_size=task.image_size,
-            elev=task.elev,
-            azim=task.azim,
-        )
-    )
-    durations.append(task.hold_duration_ms)
-    frames.append(
-        _render_frame(
-            task.filtered_result,
-            render_resolution=task.final_render_resolution,
-            image_size=task.image_size,
-            elev=task.elev,
-            azim=task.azim,
-        )
-    )
-    durations.append(task.hold_duration_ms)
+        durations.append(FINAL_HOLD_DURATION_MS if step == 0 else FRAME_DURATION_MS)
 
     frames[0].save(
         task.output,
@@ -399,7 +362,6 @@ def _render_frame(
     image_size: int,
     elev: float,
     azim: float,
-    removed: torch.Tensor | None = None,
 ) -> Image.Image:
     if isinstance(voxels, torch.Tensor):
         occupied = voxels.detach().cpu().numpy().astype(bool)
@@ -408,17 +370,7 @@ def _render_frame(
     if occupied.ndim != 3:
         raise ValueError(f"Expected one [D, H, W] voxel sample, got {occupied.shape}.")
 
-    values = occupied.astype(np.uint8)
-    if removed is not None:
-        if isinstance(removed, torch.Tensor):
-            removed_mask = removed.detach().cpu().numpy().astype(bool)
-        else:
-            removed_mask = np.asarray(removed).astype(bool)
-        if removed_mask.shape != occupied.shape:
-            raise ValueError("removed mask must have the same shape as voxels.")
-        values[removed_mask] = 2
-
-    values = _downsample_volume(values, render_resolution)
+    values = _downsample_volume(occupied.astype(np.uint8), render_resolution)
     return _render_voxel_cubes(
         values,
         image_size=image_size,
@@ -457,7 +409,6 @@ def _render_voxel_cubes(
     right, up, view = _camera_basis(elev=elev, azim=azim)
     polygons: list[np.ndarray] = []
     depths: list[np.ndarray] = []
-    colors: list[np.ndarray] = []
     shades: list[float] = []
 
     light = np.asarray((0.45, -0.55, 1.0), dtype=np.float64)
@@ -474,7 +425,6 @@ def _render_voxel_cubes(
         vertices = _face_vertices(coordinates, axis=axis, sign=sign)
         polygons.append(np.stack((vertices @ right, vertices @ up), axis=-1))
         depths.append((vertices @ view).mean(axis=1))
-        colors.append(values[tuple(coordinates.T)])
         shades.append(0.58 + 0.42 * max(0.0, float(normal @ light)))
 
     if not polygons:
@@ -482,20 +432,21 @@ def _render_voxel_cubes(
 
     polygon_array = np.concatenate(polygons, axis=0)
     depth_array = np.concatenate(depths, axis=0)
-    color_array = np.concatenate(colors, axis=0)
     shade_array = np.concatenate(
         [np.full(len(group), shade) for group, shade in zip(polygons, shades)]
     )
     pixel_polygons = _project_to_pixels(polygon_array, values.shape, right, up, image_size)
     order = np.argsort(depth_array)
-    base_colors = {
-        1: np.asarray((37, 99, 235), dtype=np.float64),
-        2: np.asarray((239, 68, 68), dtype=np.float64),
-    }
+    base_color = np.asarray((37, 99, 235), dtype=np.float64)
     for index in order:
-        base = base_colors[int(color_array[index])]
-        fill = tuple(np.clip(base * shade_array[index], 0, 255).astype(np.uint8).tolist())
-        edge = tuple(np.clip(base * shade_array[index] * 0.55, 0, 255).astype(np.uint8).tolist())
+        fill = tuple(
+            np.clip(base_color * shade_array[index], 0, 255).astype(np.uint8).tolist()
+        )
+        edge = tuple(
+            np.clip(base_color * shade_array[index] * 0.55, 0, 255)
+            .astype(np.uint8)
+            .tolist()
+        )
         points = [tuple(point) for point in pixel_polygons[index].round().astype(np.int32)]
         draw.polygon(points, fill=fill, outline=edge, width=1)
 
