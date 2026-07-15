@@ -33,7 +33,7 @@ The transition matrices compose exactly:
 ```math
 \bar Q_t = Q_1 Q_2 \cdots Q_t,
 \qquad
-q(x_t\mid x_0)=\operatorname{Cat}(x_0\bar Q_t).
+q(x_t\mid x_0)=\mathrm{Cat}(x_0\bar Q_t).
 ```
 
 As `t` increases, the clean token is progressively forgotten and the marginal approaches the uniform categorical distribution. Sampling `x_t` therefore requires one matrix lookup and a categorical draw rather than simulating every earlier step.
@@ -46,7 +46,7 @@ The denoiser receives a corrupted sample, its timestep, and an optional conditio
 
 ```math
 p_\theta(x_0\mid x_t,t,y)
-=\operatorname{softmax}\bigl(f_\theta(x_t,t,y)\bigr).
+=\mathrm{softmax}\bigl(f_\theta(x_t,t,y)\bigr).
 ```
 
 Training draws a random timestep and minimizes clean-token cross entropy:
@@ -115,16 +115,16 @@ The reverse chain exposes the transition from categorical noise to a clean digit
 
 ### ModelNet10 Voxels
 
-The same diffusion core generates binary `64^3` occupancy grids. These examples show four conditioned geometric subtypes after connected-component cleanup.
+The same diffusion core generates binary `64^3` occupancy grids. Each animation runs directly from categorical noise to the cleaned final object, showing four conditioned geometric subtypes.
 
 <table>
   <tr>
-    <td align="center"><img src="results/modelnet10/chair_0.png" alt="Generated chair subtype voxel sample" width="300"><br>chair_0</td>
-    <td align="center"><img src="results/modelnet10/sofa_2.png" alt="Generated sofa subtype voxel sample" width="300"><br>sofa_2</td>
+    <td align="center"><img src="results/modelnet10/reverse_diffusion_chair_0.gif" alt="Reverse diffusion generating a chair subtype voxel sample" width="300"><br>chair_0</td>
+    <td align="center"><img src="results/modelnet10/reverse_diffusion_sofa_2.gif" alt="Reverse diffusion generating a sofa subtype voxel sample" width="300"><br>sofa_2</td>
   </tr>
   <tr>
-    <td align="center"><img src="results/modelnet10/bed_0.png" alt="Generated bed subtype voxel sample" width="300"><br>bed_0</td>
-    <td align="center"><img src="results/modelnet10/monitor_1.png" alt="Generated monitor subtype voxel sample" width="300"><br>monitor_1</td>
+    <td align="center"><img src="results/modelnet10/reverse_diffusion_bed_0.gif" alt="Reverse diffusion generating a bed subtype voxel sample" width="300"><br>bed_0</td>
+    <td align="center"><img src="results/modelnet10/reverse_diffusion_monitor_1.gif" alt="Reverse diffusion generating a monitor subtype voxel sample" width="300"><br>monitor_1</td>
   </tr>
 </table>
 
@@ -133,9 +133,9 @@ The same diffusion core generates binary `64^3` occupancy grids. These examples 
 Discrete diffusion keeps the probabilistic model in the same state space as the data:
 
 ```math
-q(x_t\mid x_0)=\operatorname{Cat}(x_0\bar Q_t),
+q(x_t\mid x_0)=\mathrm{Cat}(x_0\bar Q_t),
 \qquad
-p_\theta(x_0\mid x_t,t,y)=\operatorname{softmax}(f_\theta(x_t,t,y)).
+p_\theta(x_0\mid x_t,t,y)=\mathrm{softmax}(f_\theta(x_t,t,y)).
 ```
 
 One categorical engine can therefore support both quantized 2D images and binary 3D geometry; only the representation, denoiser, and conditioning signal change.
