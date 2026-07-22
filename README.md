@@ -81,15 +81,6 @@ q(x_{t-1}=i\mid x_t=j,x_0=k)
 
 Iterating this distribution from `T` to `0` turns discrete noise into a sample while preserving categorical states at every step. The sampler is implemented in [`src/ddiff/diffusion/categorical.py`](src/ddiff/diffusion/categorical.py), with dataset-level label handling and output serialization in [`src/ddiff/sample.py`](src/ddiff/sample.py).
 
-## Relation to Gaussian Diffusion
-
-| Method | State space | Forward corruption | Model prediction | Reverse update |
-| --- | --- | --- | --- | --- |
-| Gaussian diffusion | Continuous | Add Gaussian noise | Noise, score, or clean data | Gaussian transition |
-| This demo | Finite categorical | Multiply by `Q_t` | Clean-token logits | Exact categorical posterior |
-
-The conceptual structure is the same—destroy information, learn to recover it, then reverse the path—but the probability model matches the discrete data directly.
-
 ## Inside This Demo
 
 | Experiment | Representation | Denoiser | Conditioning | Output |
@@ -100,6 +91,15 @@ The conceptual structure is the same—destroy information, learn to recover it,
 The MNIST model is in [`src/ddiff/models/cnn2d.py`](src/ddiff/models/cnn2d.py). The voxel model is in [`src/ddiff/models/unet3d.py`](src/ddiff/models/unet3d.py). Both inject timestep and label embeddings into residual blocks, then emit one logit channel per categorical value.
 
 For ModelNet10, meshes are normalized and voxelized, a supervised 3D classifier provides shape embeddings, and per-class clustering produces readable subtype conditions such as `chair_0` and `sofa_2`. Disconnected floating fragments are removed after sampling; this cleanup does not alter the learned reverse process.
+
+## Relation to Gaussian Diffusion
+
+| Method | State space | Forward corruption | Model prediction | Reverse update |
+| --- | --- | --- | --- | --- |
+| Gaussian diffusion | Continuous | Add Gaussian noise | Noise, score, or clean data | Gaussian transition |
+| This demo | Finite categorical | Multiply by `Q_t` | Clean-token logits | Exact categorical posterior |
+
+The conceptual structure is the same—destroy information, learn to recover it, then reverse the path—but the probability model matches the discrete data directly.
 
 ## Results
 
